@@ -73,6 +73,13 @@ interface SearchState {
   query: string;
 }
 
+interface Account {
+  id: string;
+  name: string;
+  phone: string | null;
+  isActive: boolean;
+}
+
 interface SocketContextType {
   socket: Socket | null;
   isConnected: boolean;
@@ -84,6 +91,8 @@ interface SocketContextType {
   syncProgress: SyncProgress;
   searchState: SearchState;
   privacyMode: boolean;
+  accounts: Account[];
+  currentAccountId: string | null;
   setPrivacyMode: (value: boolean) => void;
   fetchChats: () => void;
   fetchMessages: (chatId: string) => void;
@@ -92,6 +101,9 @@ interface SocketContextType {
   sendMessage: (chatId: string, message: string) => void;
   clearSearch: () => void;
   logout: () => void;
+  addAccount: (name: string) => void;
+  switchAccount: (accountId: string) => void;
+  deleteAccount: (accountId: string) => void;
 }
 
 const defaultSyncProgress: SyncProgress = {
@@ -123,12 +135,16 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [syncProgress, setSyncProgress] = useState<SyncProgress>(defaultSyncProgress);
   const [searchState, setSearchState] = useState<SearchState>(defaultSearchState);
   const [privacyMode, setPrivacyMode] = useState(false);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
 
   useEffect(() => {
     const newSocket = io();
 
     newSocket.on("connect", () => {
       setIsConnected(true);
+      // Request accounts on connect
+      newSocket.emit("getAccounts");
     });
 
     newSocket.on("disconnect", () => {
@@ -286,6 +302,23 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setSearchState(defaultSearchState);
     });
 
+    // Account management events
+    newSocket.on("accounts", (data: Account[]) => {
+      setAccounts(data);
+    });
+
+    newSocket.on("currentAccount", (accountId: string | null) => {
+      setCurrentAccountId(accountId);
+    });
+
+    newSocket.on("accountsUpdated", (data: Account[]) => {
+      setAccounts(data);
+    });
+
+    newSocket.on("accountAdded", (account: Account) => {
+      setAccounts(prev => [...prev, account]);
+    });
+
     setSocket(newSocket);
 
     return () => {
@@ -356,6 +389,33 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, [socket]);
 
+  const addAccount = useCallback((name: string) => {
+    if (socket) {
+      socket.emit("addAccount", { name });
+    }
+  }, [socket]);
+
+  const switchAccount = useCallback((accountId: string) => {
+    if (socket) {
+      console.log("Switching to account:", accountId);
+      socket.emit("switchAccount", { accountId });
+      // Clear data immediately
+      setIsReady(false);
+      setChats([]);
+      setMessages({});
+      setQrCode(null);
+      setIsLoading(false);
+      setSyncProgress(defaultSyncProgress);
+      setSearchState(defaultSearchState);
+    }
+  }, [socket]);
+
+  const deleteAccount = useCallback((accountId: string) => {
+    if (socket) {
+      socket.emit("deleteAccount", { accountId });
+    }
+  }, [socket]);
+
   return (
     <SocketContext.Provider
       value={{
@@ -369,6 +429,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         syncProgress,
         searchState,
         privacyMode,
+        accounts,
+        currentAccountId,
         setPrivacyMode,
         fetchChats,
         fetchMessages,
@@ -377,6 +439,9 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         sendMessage,
         clearSearch,
         logout,
+        addAccount,
+        switchAccount,
+        deleteAccount,
       }}
     >
       {children}

@@ -16,6 +16,7 @@ import {
   Heart,
 } from "lucide-react";
 import ExportButton from "./ExportButton";
+import AccountDropdown from "./AccountDropdown";
 
 const navItems = [
   { href: "/dashboard/chats", label: "المحادثات", icon: MessageCircle },
@@ -53,7 +54,7 @@ export default function Sidebar() {
       >
         <div className="flex flex-col h-full p-4">
           {/* Logo */}
-          <div className="flex items-center gap-3 mb-8">
+          <div className="flex items-center gap-3 mb-4">
             <div className="w-10 h-10 rounded-full bg-gradient-to-br from-green-500 to-teal-600 flex items-center justify-center">
               <MessageCircle className="w-6 h-6 text-white" />
             </div>
@@ -75,6 +76,11 @@ export default function Sidebar() {
                 )}
               </div>
             </div>
+          </div>
+
+          {/* Account Dropdown */}
+          <div className="mb-4">
+            <AccountDropdown />
           </div>
 
           {/* Navigation */}

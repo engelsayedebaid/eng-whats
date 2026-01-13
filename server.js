@@ -11,8 +11,37 @@ const port = process.env.PORT || 3000;
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
-// In-memory store for chats
-let chats = [];
+// Multi-account support
+const fs = require('fs');
+const path = require('path');
+const accountsFile = path.join(__dirname, 'accounts.json');
+
+// Load accounts from file
+const loadAccounts = () => {
+  try {
+    if (fs.existsSync(accountsFile)) {
+      return JSON.parse(fs.readFileSync(accountsFile, 'utf8'));
+    }
+  } catch (error) {
+    console.error('Error loading accounts:', error);
+  }
+  return [];
+};
+
+// Save accounts to file
+const saveAccounts = (accounts) => {
+  try {
+    fs.writeFileSync(accountsFile, JSON.stringify(accounts, null, 2));
+  } catch (error) {
+    console.error('Error saving accounts:', error);
+  }
+};
+
+// Accounts management
+let accounts = loadAccounts(); // [{ id, name, phone, isActive }]
+let whatsappClients = new Map(); // Map<accountId, Client>
+let currentAccountId = accounts.find(a => a.isActive)?.id || null;
+let chats = []; // Store chats per account
 let isReady = false;
 
 // Find Chromium executable path
@@ -51,35 +80,259 @@ const getChromiumPath = () => {
   return undefined; // Use bundled Chromium
 };
 
-// WhatsApp Client
-const whatsappClient = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    executablePath: getChromiumPath(),
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--disable-gpu",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-blink-features=AutomationControlled",
-    ],
-    // Add timeout and ignore errors
-    timeout: 0, // No timeout for page load
-    ignoreHTTPSErrors: true,
-    // Increase protocol timeout significantly to prevent Runtime.callFunctionOn timeout
-    // Set to very high value (1 hour) for large number of chats - no limit
-    protocolTimeout: 3600000, // 1 hour (3600000ms) - effectively unlimited
-  },
-});
+// Create WhatsApp Client function
+const createWhatsAppClient = (accountId) => {
+  return new Client({
+    authStrategy: new LocalAuth({ clientId: accountId }),
+    puppeteer: {
+      headless: true,
+      executablePath: getChromiumPath(),
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--no-first-run",
+        "--disable-gpu",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      timeout: 0,
+      ignoreHTTPSErrors: true,
+      protocolTimeout: 3600000,
+    },
+  });
+};
+
+// Get current active client
+const getCurrentClient = () => {
+  if (!currentAccountId) return null;
+  return whatsappClients.get(currentAccountId);
+};
+
+// Setup client events
+const setupClientEvents = (client, accountId) => {
+  client.on("qr", (qr) => {
+    console.log(`QR Code received for account ${accountId}`);
+    if (accountId === currentAccountId) {
+      io.emit("qr", qr);
+    }
+  });
+
+  client.on("ready", () => {
+    console.log(`WhatsApp client ${accountId} is ready!`);
+    if (accountId === currentAccountId) {
+      isReady = true;
+      const account = accounts.find(a => a.id === accountId);
+      if (account && client.info) {
+        account.phone = client.info.wid.user;
+        account.name = client.info.pushname || account.name;
+        saveAccounts(accounts);
+      }
+      io.emit("status", { isReady: true });
+      io.emit("ready");
+      io.emit("accountsUpdated", accounts);
+    }
+  });
+
+  client.on("authenticated", () => {
+    console.log(`WhatsApp client ${accountId} authenticated`);
+  });
+
+  client.on("auth_failure", (msg) => {
+    console.error(`Auth failure for account ${accountId}:`, msg);
+    if (accountId === currentAccountId) {
+      io.emit("authFailure", { message: msg });
+    }
+  });
+
+  client.on("disconnected", (reason) => {
+    console.log(`WhatsApp ${accountId} disconnected:`, reason);
+    if (accountId === currentAccountId) {
+      isReady = false;
+      io.emit("status", { isReady: false });
+      io.emit("disconnected", { reason });
+    }
+  });
+
+  client.on("message", async (message) => {
+    if (accountId === currentAccountId) {
+      console.log("New message received from:", message.from);
+      
+      let senderName = "مجهول";
+      let senderPhone = message.from.split("@")[0];
+      
+      try {
+        const contact = await message.getContact();
+        senderName = contact.pushname || contact.name || senderPhone;
+      } catch (e) {
+        // Ignore contact errors
+      }
+      
+      const typeLabels = {
+        chat: "نص",
+        image: "صورة 📷",
+        video: "فيديو 🎥",
+        audio: "صوت 🎵",
+        ptt: "رسالة صوتية 🎤",
+        document: "مستند 📄",
+        sticker: "ملصق",
+        location: "موقع 📍",
+        contact: "جهة اتصال 👤",
+        poll_creation: "استطلاع 📊",
+      };
+      
+      io.emit("newMessage", {
+        id: message.id._serialized,
+        body: message.body || typeLabels[message.type] || "",
+        fromMe: message.fromMe,
+        from: message.from,
+        chatId: message.from,
+        timestamp: message.timestamp,
+        type: message.type,
+        typeLabel: typeLabels[message.type] || "نص",
+        senderName: senderName,
+        senderPhone: senderPhone,
+      });
+    }
+  });
+
+  client.on("message_create", async (message) => {
+    if (message.fromMe && accountId === currentAccountId) {
+      console.log("Message sent to:", message.to);
+      
+      const typeLabels = {
+        chat: "نص",
+        image: "صورة 📷",
+        video: "فيديو 🎥",
+        audio: "صوت 🎵",
+        ptt: "رسالة صوتية 🎤",
+        document: "مستند 📄",
+        sticker: "ملصق",
+        location: "موقع 📍",
+        contact: "جهة اتصال 👤",
+        poll_creation: "استطلاع 📊",
+      };
+      
+      io.emit("newMessage", {
+        id: message.id._serialized,
+        body: message.body || typeLabels[message.type] || "",
+        fromMe: true,
+        from: message.to,
+        chatId: message.to,
+        timestamp: message.timestamp,
+        type: message.type,
+        typeLabel: typeLabels[message.type] || "نص",
+        senderName: "أنا",
+        senderPhone: "",
+      });
+    }
+  });
+
+  client.on("error", (error) => {
+    console.error(`WhatsApp client ${accountId} error:`, error);
+    if (error.message && error.message.includes('Target closed')) {
+      console.log(`Browser target closed for ${accountId}, attempting to reinitialize...`);
+      setTimeout(() => {
+        if (accountId === currentAccountId && !isReady) {
+          console.log(`Reinitializing WhatsApp client ${accountId}...`);
+          client.initialize().catch(err => {
+            console.error(`Failed to reinitialize ${accountId}:`, err.message);
+          });
+        }
+      }, 5000);
+    }
+  });
+};
 
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => {
     const parsedUrl = parse(req.url, true);
+    
+    // API endpoints for account management
+    if (parsedUrl.pathname === '/api/accounts' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(accounts));
+      return;
+    }
+    
+    if (parsedUrl.pathname === '/api/accounts' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk.toString(); });
+      req.on('end', () => {
+        try {
+          const { name } = JSON.parse(body);
+          const accountId = `account_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          const newAccount = { id: accountId, name: name || `حساب ${accounts.length + 1}`, phone: null, isActive: false };
+          accounts.push(newAccount);
+          saveAccounts(accounts);
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ success: true, account: newAccount }));
+        } catch (error) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ success: false, error: error.message }));
+        }
+      });
+      return;
+    }
+    
+    if (parsedUrl.pathname.startsWith('/api/accounts/') && req.method === 'DELETE') {
+      const accountId = parsedUrl.pathname.split('/')[3];
+      accounts = accounts.filter(a => a.id !== accountId);
+      if (currentAccountId === accountId) {
+        const client = whatsappClients.get(accountId);
+        if (client) {
+          client.destroy();
+        }
+        whatsappClients.delete(accountId);
+        currentAccountId = accounts[0]?.id || null;
+        isReady = false;
+      } else {
+        const client = whatsappClients.get(accountId);
+        if (client) {
+          client.destroy();
+        }
+        whatsappClients.delete(accountId);
+      }
+      saveAccounts(accounts);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+    
+    if (parsedUrl.pathname.startsWith('/api/accounts/') && parsedUrl.pathname.endsWith('/switch') && req.method === 'POST') {
+      const accountId = parsedUrl.pathname.split('/')[3];
+      const account = accounts.find(a => a.id === accountId);
+      if (account) {
+        // Deactivate current account
+        accounts.forEach(a => a.isActive = false);
+        account.isActive = true;
+        currentAccountId = accountId;
+        saveAccounts(accounts);
+        
+        // Initialize client if not exists
+        if (!whatsappClients.has(accountId)) {
+          const client = createWhatsAppClient(accountId);
+          setupClientEvents(client, accountId);
+          whatsappClients.set(accountId, client);
+          client.initialize();
+        } else {
+          const client = whatsappClients.get(accountId);
+          if (!client.info) {
+            client.initialize();
+          }
+        }
+        
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true, account }));
+      } else {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ success: false, error: 'Account not found' }));
+      }
+      return;
+    }
+    
     handle(req, res, parsedUrl);
   });
 
@@ -97,9 +350,14 @@ app.prepare().then(() => {
     // Send current status
     socket.emit("status", { isReady });
 
+    // Send accounts list
+    socket.emit("accounts", accounts);
+    socket.emit("currentAccount", currentAccountId);
+
     // Request to fetch chats
     socket.on("getChats", async () => {
-      if (!isReady) {
+      const whatsappClient = getCurrentClient();
+      if (!isReady || !whatsappClient) {
         socket.emit("chatsError", { message: "WhatsApp not ready" });
         return;
       }
@@ -253,7 +511,8 @@ app.prepare().then(() => {
 
     // Request to get messages for a specific chat (with media support)
     socket.on("getMessages", async ({ chatId, limit = 50 }) => {
-      if (!isReady) {
+      const whatsappClient = getCurrentClient();
+      if (!isReady || !whatsappClient) {
         socket.emit("messagesError", { message: "WhatsApp not ready" });
         return;
       }
@@ -324,7 +583,8 @@ app.prepare().then(() => {
 
     // Send message
     socket.on("sendMessage", async ({ chatId, message }) => {
-      if (!isReady) {
+      const whatsappClient = getCurrentClient();
+      if (!isReady || !whatsappClient) {
         socket.emit("sendMessageError", { message: "WhatsApp not ready" });
         return;
       }
@@ -357,7 +617,8 @@ app.prepare().then(() => {
 
     // Search messages across all chats
     socket.on("searchMessages", async ({ query, maxChats = 50, maxMessagesPerChat = 30 }) => {
-      if (!isReady) {
+      const whatsappClient = getCurrentClient();
+      if (!isReady || !whatsappClient) {
         socket.emit("searchProgress", { status: "error", message: "واتساب غير جاهز", progress: 0 });
         socket.emit("searchResults", { results: [], query: "" });
         return;
@@ -491,7 +752,8 @@ app.prepare().then(() => {
 
     // Sync all chats (fetch more chats with progress)
     socket.on("syncAllChats", async ({ maxChats } = {}) => {
-      if (!isReady) {
+      const whatsappClient = getCurrentClient();
+      if (!isReady || !whatsappClient) {
         console.log("Sync requested but WhatsApp not ready");
         socket.emit("chatsError", { message: "WhatsApp not ready" });
         socket.emit("syncProgress", { 
@@ -527,13 +789,23 @@ app.prepare().then(() => {
         
         // إضافة timeout و progress indicator أثناء جلب المحادثات
         let progressInterval;
+        let fakeProgress = 1;
         const startProgressIndicator = () => {
-          let fakeProgress = 1;
+          const messages = [
+            "جاري جلب قائمة المحادثات...",
+            "يرجى الانتظار، يتم تحميل البيانات...",
+            "جاري الاتصال بخوادم واتساب...",
+            "يتم جلب المحادثات، قد يستغرق وقتاً...",
+            "لا تغلق الصفحة، المزامنة قيد التنفيذ...",
+          ];
+          let msgIndex = 0;
           progressInterval = setInterval(() => {
-            fakeProgress = Math.min(fakeProgress + 0.5, 8);
+            fakeProgress = Math.min(fakeProgress + 0.3, 30);
+            const currentMsg = messages[Math.floor(msgIndex / 6) % messages.length];
+            msgIndex++;
             socket.emit("syncProgress", { 
               status: "started", 
-              message: "جاري جلب قائمة المحادثات...",
+              message: currentMsg,
               progress: fakeProgress,
               total: 0,
               current: 0
@@ -545,8 +817,7 @@ app.prepare().then(() => {
         
         let allChats;
         try {
-          // جلب المحادثات بدون timeout - يعمل حتى مع عدد كبير جداً من المحادثات
-          console.log("Fetching chats (no timeout - will wait as long as needed)...");
+          console.log("Fetching chats with 120 second timeout...");
           
           // تحديث progress message
           socket.emit("syncProgress", { 
@@ -557,8 +828,13 @@ app.prepare().then(() => {
             current: 0
           });
           
-          // جلب المحادثات بدون timeout - سينتظر حتى يكتمل
-          allChats = await whatsappClient.getChats();
+          // جلب المحادثات مع timeout 120 ثانية
+          const getChatsPromise = whatsappClient.getChats();
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('انتهت مهلة جلب المحادثات (120 ثانية). حاول مرة أخرى أو أعد تشغيل الواتساب.')), 120000);
+          });
+          
+          allChats = await Promise.race([getChatsPromise, timeoutPromise]);
           
           console.log(`Successfully got ${allChats.length} chats`);
           
@@ -791,114 +1067,9 @@ app.prepare().then(() => {
     });
   });
 
-  // WhatsApp events
-  whatsappClient.on("qr", (qr) => {
-    console.log("QR Code received");
-    io.emit("qr", qr);
-  });
-
-  whatsappClient.on("ready", () => {
-    console.log("WhatsApp client is ready!");
-    isReady = true;
-    io.emit("status", { isReady: true });
-    io.emit("ready");
-  });
-
-  whatsappClient.on("authenticated", () => {
-    console.log("WhatsApp client authenticated");
-  });
-
-  whatsappClient.on("auth_failure", (msg) => {
-    console.error("Auth failure:", msg);
-    io.emit("authFailure", { message: msg });
-  });
-
-  whatsappClient.on("disconnected", (reason) => {
-    console.log("WhatsApp disconnected:", reason);
-    isReady = false;
-    io.emit("status", { isReady: false });
-    io.emit("disconnected", { reason });
-  });
-
-  whatsappClient.on("message", async (message) => {
-    console.log("New message received from:", message.from);
-    
-    // Get sender info
-    let senderName = "مجهول";
-    let senderPhone = message.from.split("@")[0];
-    
-    try {
-      const contact = await message.getContact();
-      senderName = contact.pushname || contact.name || senderPhone;
-    } catch (e) {
-      // Ignore contact errors
-    }
-    
-    // Get message type label
-    const typeLabels = {
-      chat: "نص",
-      image: "صورة 📷",
-      video: "فيديو 🎥",
-      audio: "صوت 🎵",
-      ptt: "رسالة صوتية 🎤",
-      document: "مستند 📄",
-      sticker: "ملصق",
-      location: "موقع 📍",
-      contact: "جهة اتصال 👤",
-      poll_creation: "استطلاع 📊",
-    };
-    
-    io.emit("newMessage", {
-      id: message.id._serialized,
-      body: message.body || typeLabels[message.type] || "",
-      fromMe: message.fromMe,
-      from: message.from,
-      chatId: message.from,
-      timestamp: message.timestamp,
-      type: message.type,
-      typeLabel: typeLabels[message.type] || "نص",
-      senderName: senderName,
-      senderPhone: senderPhone,
-    });
-  });
-
-  // Also listen for outgoing messages
-  whatsappClient.on("message_create", async (message) => {
-    if (message.fromMe) {
-      console.log("Message sent to:", message.to);
-      
-      const typeLabels = {
-        chat: "نص",
-        image: "صورة 📷",
-        video: "فيديو 🎥",
-        audio: "صوت 🎵",
-        ptt: "رسالة صوتية 🎤",
-        document: "مستند 📄",
-        sticker: "ملصق",
-        location: "موقع 📍",
-        contact: "جهة اتصال 👤",
-        poll_creation: "استطلاع 📊",
-      };
-      
-      io.emit("newMessage", {
-        id: message.id._serialized,
-        body: message.body || typeLabels[message.type] || "",
-        fromMe: true,
-        from: message.to,
-        chatId: message.to,
-        timestamp: message.timestamp,
-        type: message.type,
-        typeLabel: typeLabels[message.type] || "نص",
-        senderName: "أنا",
-        senderPhone: "",
-      });
-    }
-  });
-
   // Error handlers for unhandled rejections
   process.on('unhandledRejection', (error) => {
     console.error('Unhandled Rejection:', error);
-    // Don't crash the server, just log the error
     if (error.message && error.message.includes('Target closed')) {
       console.log('Browser target closed, this is usually harmless');
     }
@@ -906,34 +1077,31 @@ app.prepare().then(() => {
 
   process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    // Don't crash the server, just log the error
   });
 
-  // WhatsApp client error handlers
-  whatsappClient.on("error", (error) => {
-    console.error("WhatsApp client error:", error);
-    // Don't crash, just log
-    if (error.message && error.message.includes('Target closed')) {
-      console.log('Browser target closed, attempting to reinitialize...');
-      // Optionally reinitialize after a delay
-      setTimeout(() => {
-        if (!isReady) {
-          console.log('Reinitializing WhatsApp client...');
-          whatsappClient.initialize().catch(err => {
-            console.error('Failed to reinitialize:', err.message);
-          });
-        }
-      }, 5000);
-    }
-  });
-
-  // Initialize WhatsApp client with error handling
-  whatsappClient.initialize().catch((error) => {
-    console.error("Failed to initialize WhatsApp client:", error);
-    if (error.message && error.message.includes('Target closed')) {
-      console.log('Browser target closed during initialization, this may be temporary');
-    }
-  });
+  // Initialize first account if exists
+  if (currentAccountId) {
+    const client = createWhatsAppClient(currentAccountId);
+    setupClientEvents(client, currentAccountId);
+    whatsappClients.set(currentAccountId, client);
+    client.initialize().catch((error) => {
+      console.error("Failed to initialize WhatsApp client:", error);
+    });
+  } else if (accounts.length === 0) {
+    // Create default account if no accounts exist
+    const defaultAccountId = `account_${Date.now()}`;
+    const defaultAccount = { id: defaultAccountId, name: "حساب 1", phone: null, isActive: true };
+    accounts.push(defaultAccount);
+    currentAccountId = defaultAccountId;
+    saveAccounts(accounts);
+    
+    const client = createWhatsAppClient(defaultAccountId);
+    setupClientEvents(client, defaultAccountId);
+    whatsappClients.set(defaultAccountId, client);
+    client.initialize().catch((error) => {
+      console.error("Failed to initialize WhatsApp client:", error);
+    });
+  }
 
   httpServer.listen(port, () => {
     console.log(`> Ready on http://${hostname}:${port}`);
