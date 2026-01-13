@@ -97,11 +97,36 @@ const createWhatsAppClient = (accountId) => {
         "--disable-web-security",
         "--disable-features=IsolateOrigins,site-per-process",
         "--disable-blink-features=AutomationControlled",
+        // تحسينات إضافية للسرعة
+        "--disable-extensions",
+        "--disable-plugins",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-hang-monitor",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-component-update",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--metrics-recording-only",
+        "--no-default-browser-check",
+        "--autoplay-policy=user-gesture-required",
+        "--disable-component-extensions-with-background-pages",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
+        "--force-color-profile=srgb",
+        "--single-process",
       ],
-      timeout: 0,
+      timeout: 60000, // 60 ثانية timeout بدلاً من 0
       ignoreHTTPSErrors: true,
-      protocolTimeout: 3600000,
+      protocolTimeout: 120000, // 2 دقيقة بدلاً من ساعة
     },
+    // تحسينات إضافية للـ WhatsApp client
+    qrMaxRetries: 5,
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
   });
 };
 
