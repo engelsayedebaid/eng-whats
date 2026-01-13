@@ -489,31 +489,108 @@ app.prepare().then(() => {
     // Sync all chats (fetch more chats with progress)
     socket.on("syncAllChats", async ({ maxChats } = {}) => {
       if (!isReady) {
+        console.log("Sync requested but WhatsApp not ready");
         socket.emit("chatsError", { message: "WhatsApp not ready" });
+        socket.emit("syncProgress", { 
+          status: "error", 
+          message: "واتساب غير جاهز",
+          progress: 0,
+          total: 0,
+          current: 0
+        });
         return;
       }
 
       try {
         console.log("Syncing all chats...");
         
-        // Emit sync started
+        // Emit sync started with initial progress
         socket.emit("syncProgress", { 
           status: "started", 
           message: "جاري جلب المحادثات...",
-          progress: 0,
+          progress: 1,
           total: 0,
           current: 0
         });
         
-        const allChats = await whatsappClient.getChats();
+        // Force emit to ensure it's sent
+        socket.volatile.emit("syncProgress", { 
+          status: "started", 
+          message: "جاري جلب المحادثات...",
+          progress: 1,
+          total: 0,
+          current: 0
+        });
+        
+        // إضافة timeout و progress indicator أثناء جلب المحادثات
+        let progressInterval;
+        const startProgressIndicator = () => {
+          let fakeProgress = 1;
+          progressInterval = setInterval(() => {
+            fakeProgress = Math.min(fakeProgress + 0.5, 8);
+            socket.emit("syncProgress", { 
+              status: "started", 
+              message: "جاري جلب قائمة المحادثات...",
+              progress: fakeProgress,
+              total: 0,
+              current: 0
+            });
+          }, 500);
+        };
+        
+        startProgressIndicator();
+        
+        let allChats;
+        try {
+          // إضافة timeout لـ getChats (30 ثانية)
+          const getChatsPromise = whatsappClient.getChats();
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Timeout: جلب المحادثات استغرق وقتاً طويلاً")), 30000)
+          );
+          
+          allChats = await Promise.race([getChatsPromise, timeoutPromise]);
+        } catch (error) {
+          clearInterval(progressInterval);
+          console.error("Error getting chats:", error);
+          socket.emit("syncProgress", { 
+            status: "error", 
+            message: `خطأ في جلب المحادثات: ${error.message}`,
+            progress: 0,
+            total: 0,
+            current: 0
+          });
+          socket.volatile.emit("syncProgress", { 
+            status: "error", 
+            message: `خطأ في جلب المحادثات: ${error.message}`,
+            progress: 0,
+            total: 0,
+            current: 0
+          });
+          return;
+        }
+        
+        clearInterval(progressInterval);
+        
         // لا يوجد حد أقصى - معالجة جميع المحادثات
         const totalChats = maxChats ? Math.min(allChats.length, maxChats) : allChats.length;
         console.log(`Found ${allChats.length} chats, processing all ${totalChats}...`);
         
+        if (totalChats === 0) {
+          socket.emit("syncProgress", { 
+            status: "completed", 
+            message: "لا توجد محادثات للمزامنة",
+            progress: 100,
+            total: 0,
+            current: 0
+          });
+          socket.emit("chats", []);
+          return;
+        }
+        
         socket.emit("syncProgress", { 
           status: "processing", 
           message: `تم العثور على ${allChats.length} محادثة، جاري المعالجة...`,
-          progress: 2,
+          progress: 10,
           total: totalChats,
           current: 0
         });
@@ -644,16 +721,21 @@ app.prepare().then(() => {
           
           // Calculate progress with better accuracy
           const current = Math.min(i + batchSize, totalChats);
-          const progress = Math.max(2, Math.min(98, Math.round((current / totalChats) * 98)));
+          // حساب progress من 10% إلى 98% (10% للبداية، 98% قبل الإكمال)
+          const progress = Math.max(10, Math.min(98, Math.round(10 + ((current / totalChats) * 88))));
           
           // Emit progress update more frequently for better UX
-          socket.emit("syncProgress", { 
+          const progressData = { 
             status: "processing", 
             message: `جاري معالجة المحادثات... (${current}/${totalChats})`,
             progress: progress,
             total: totalChats,
             current: current
-          });
+          };
+          
+          socket.emit("syncProgress", progressData);
+          // Also send as volatile to ensure delivery
+          socket.volatile.emit("syncProgress", progressData);
           
           console.log(`Processed ${current}/${totalChats} chats (${progress}%)`);
           

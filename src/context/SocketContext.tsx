@@ -177,6 +177,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Sync progress handler
     newSocket.on("syncProgress", (data: SyncProgress) => {
+      console.log("Sync progress received:", data);
       setSyncProgress(data);
 
       if (data.status === "started" || data.status === "processing") {
