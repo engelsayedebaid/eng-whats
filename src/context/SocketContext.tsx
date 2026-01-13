@@ -93,6 +93,7 @@ interface SocketContextType {
   privacyMode: boolean;
   accounts: Account[];
   currentAccountId: string | null;
+  connectionError: string | null;
   setPrivacyMode: (value: boolean) => void;
   fetchChats: () => void;
   fetchMessages: (chatId: string) => void;
@@ -104,6 +105,7 @@ interface SocketContextType {
   addAccount: (name: string) => void;
   switchAccount: (accountId: string) => void;
   deleteAccount: (accountId: string) => void;
+  clearSessions: () => void;
 }
 
 const defaultSyncProgress: SyncProgress = {
@@ -137,17 +139,35 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [privacyMode, setPrivacyMode] = useState(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   useEffect(() => {
-    const newSocket = io();
+    // Get backend URL from environment variable or default to current origin
+    const backendUrl = process.env.NEXT_PUBLIC_SOCKET_URL || (typeof window !== 'undefined' ? window.location.origin : '');
+    const newSocket = io(backendUrl, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
 
     newSocket.on("connect", () => {
       setIsConnected(true);
+      setConnectionError(null);
       // Request accounts on connect
       newSocket.emit("getAccounts");
     });
 
     newSocket.on("disconnect", () => {
+      setIsConnected(false);
+      setConnectionError("انقطع الاتصال بالخادم. يرجى التحقق من اتصال الخادم الخلفي.");
+    });
+
+    newSocket.on("connect_error", (error) => {
+      console.error("Socket connection error:", error);
+      setConnectionError(
+        `فشل الاتصال بالخادم. تأكد من أن الخادم الخلفي يعمل وأن NEXT_PUBLIC_SOCKET_URL مضبوط بشكل صحيح.`
+      );
       setIsConnected(false);
     });
 
@@ -319,6 +339,24 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setAccounts(prev => [...prev, account]);
     });
 
+    newSocket.on("qrCleared", () => {
+      console.log("QR cleared, waiting for new QR...");
+      setQrCode(null);
+      setIsReady(false);
+    });
+
+    newSocket.on("sessionsCleared", (data: { success: boolean; error?: string }) => {
+      if (data.success) {
+        console.log("Sessions cleared successfully");
+        setQrCode(null);
+        setIsReady(false);
+        setChats([]);
+        setMessages({});
+      } else {
+        console.error("Failed to clear sessions:", data.error);
+      }
+    });
+
     setSocket(newSocket);
 
     return () => {
@@ -416,6 +454,18 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, [socket]);
 
+  const clearSessions = useCallback(() => {
+    if (socket) {
+      console.log("Clearing sessions...");
+      socket.emit("clearSessions");
+      // Clear local state immediately
+      setQrCode(null);
+      setIsReady(false);
+      setChats([]);
+      setMessages({});
+    }
+  }, [socket]);
+
   return (
     <SocketContext.Provider
       value={{
@@ -431,6 +481,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         privacyMode,
         accounts,
         currentAccountId,
+        connectionError,
         setPrivacyMode,
         fetchChats,
         fetchMessages,
@@ -442,6 +493,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         addAccount,
         switchAccount,
         deleteAccount,
+        clearSessions,
       }}
     >
       {children}
