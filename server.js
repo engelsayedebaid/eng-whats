@@ -886,8 +886,6 @@ app.prepare().then(() => {
         
         const processedChats = [];
         const chatsToProcess = allChats.slice(0, totalChats);
-        // زيادة حجم الـ batch لتحسين الأداء
-        const batchSize = 20; // Process in batches for efficiency
         
         // Type labels
         const typeLabels = {
@@ -903,134 +901,131 @@ app.prepare().then(() => {
           poll_creation: "استطلاع 📊",
         };
         
-        for (let i = 0; i < chatsToProcess.length; i += batchSize) {
-          const batch = chatsToProcess.slice(i, i + batchSize);
+        // معالجة المحادثات واحدة تلو الأخرى وإرسالها فوراً
+        for (let i = 0; i < chatsToProcess.length; i++) {
+          const chat = chatsToProcess[i];
+          const chatName = chat.name || chat.id.user || chat.id._serialized.split("@")[0] || "محادثة";
           
-          // Process batch in parallel with better error handling
-          const batchResults = await Promise.allSettled(
-            batch.map(async (chat) => {
+          try {
+            const phoneNumber = chat.id._serialized.split("@")[0];
+            
+            // Get profile picture (optional, skip on error with timeout) - تقليل الـ timeout
+            let profilePic = null;
+            try {
+              const contactPromise = chat.getContact();
+              const contact = await Promise.race([
+                contactPromise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
+              ]);
+              const picPromise = contact.getProfilePicUrl();
+              profilePic = await Promise.race([
+                picPromise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000))
+              ]);
+            } catch (e) {
+              // Skip profile pic on error or timeout
+            }
+            
+            // Get participants for groups
+            let participants = [];
+            if (chat.isGroup && chat.participants) {
               try {
-                const phoneNumber = chat.id._serialized.split("@")[0];
+                participants = chat.participants.map(p => ({
+                  id: p.id._serialized,
+                  name: p.id.user,
+                  isAdmin: p.isAdmin || false,
+                  isSuperAdmin: p.isSuperAdmin || false,
+                }));
+              } catch (e) {
+                // Skip participants on error
+              }
+            }
+            
+            // Get last message info
+            let lastMessageData = null;
+            if (chat.lastMessage) {
+              try {
+                const msg = chat.lastMessage;
+                let senderName = "أنا";
                 
-                // Get profile picture (optional, skip on error with timeout)
-                let profilePic = null;
-                try {
-                  const contactPromise = chat.getContact();
-                  const contact = await Promise.race([
-                    contactPromise,
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
-                  ]);
-                  const picPromise = contact.getProfilePicUrl();
-                  profilePic = await Promise.race([
-                    picPromise,
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
-                  ]);
-                } catch (e) {
-                  // Skip profile pic on error or timeout
+                if (!msg.fromMe && chat.isGroup) {
+                  const senderId = msg.author || msg.from;
+                  senderName = senderId ? senderId.split("@")[0] : "مجهول";
+                } else if (!msg.fromMe) {
+                  senderName = chat.name || phoneNumber;
                 }
                 
-                // Get participants for groups
-                let participants = [];
-                if (chat.isGroup && chat.participants) {
-                  try {
-                    participants = chat.participants.map(p => ({
-                      id: p.id._serialized,
-                      name: p.id.user,
-                      isAdmin: p.isAdmin || false,
-                      isSuperAdmin: p.isSuperAdmin || false,
-                    }));
-                  } catch (e) {
-                    // Skip participants on error
-                  }
-                }
-                
-                // Get last message info
-                let lastMessageData = null;
-                if (chat.lastMessage) {
-                  try {
-                    const msg = chat.lastMessage;
-                    let senderName = "أنا";
-                    
-                    if (!msg.fromMe && chat.isGroup) {
-                      const senderId = msg.author || msg.from;
-                      senderName = senderId ? senderId.split("@")[0] : "مجهول";
-                    } else if (!msg.fromMe) {
-                      senderName = chat.name || phoneNumber;
-                    }
-                    
-                    lastMessageData = {
-                      body: msg.body || typeLabels[msg.type] || "",
-                      fromMe: msg.fromMe || false,
-                      timestamp: msg.timestamp || Date.now() / 1000,
-                      type: msg.type || "chat",
-                      typeLabel: typeLabels[msg.type] || "نص",
-                      senderName: senderName,
-                    };
-                  } catch (e) {
-                    // Skip last message on error
-                  }
-                }
-                
-                return {
-                  id: chat.id._serialized,
-                  name: chat.name || chat.id.user || phoneNumber || "Unknown",
-                  phone: phoneNumber,
-                  profilePic: profilePic,
-                  isGroup: chat.isGroup || false,
-                  participants: participants,
-                  participantCount: participants.length,
-                  unreadCount: chat.unreadCount || 0,
-                  lastMessage: lastMessageData,
-                  timestamp: chat.timestamp || Date.now() / 1000,
+                lastMessageData = {
+                  body: msg.body || typeLabels[msg.type] || "",
+                  fromMe: msg.fromMe || false,
+                  timestamp: msg.timestamp || Date.now() / 1000,
+                  type: msg.type || "chat",
+                  typeLabel: typeLabels[msg.type] || "نص",
+                  senderName: senderName,
                 };
               } catch (e) {
-                // Return minimal data on error
-                return {
-                  id: chat.id._serialized,
-                  name: chat.name || chat.id.user || "Unknown",
-                  phone: chat.id._serialized.split("@")[0],
-                  profilePic: null,
-                  isGroup: chat.isGroup || false,
-                  participants: [],
-                  participantCount: 0,
-                  unreadCount: 0,
-                  lastMessage: null,
-                  timestamp: chat.timestamp || Date.now() / 1000,
-                };
+                // Skip last message on error
               }
-            })
-          );
+            }
+            
+            const processedChat = {
+              id: chat.id._serialized,
+              name: chat.name || chat.id.user || phoneNumber || "Unknown",
+              phone: phoneNumber,
+              profilePic: profilePic,
+              isGroup: chat.isGroup || false,
+              participants: participants,
+              participantCount: participants.length,
+              unreadCount: chat.unreadCount || 0,
+              lastMessage: lastMessageData,
+              timestamp: chat.timestamp || Date.now() / 1000,
+            };
+            
+            processedChats.push(processedChat);
+            
+          } catch (e) {
+            // Return minimal data on error
+            const processedChat = {
+              id: chat.id._serialized,
+              name: chat.name || chat.id.user || "Unknown",
+              phone: chat.id._serialized.split("@")[0],
+              profilePic: null,
+              isGroup: chat.isGroup || false,
+              participants: [],
+              participantCount: 0,
+              unreadCount: 0,
+              lastMessage: null,
+              timestamp: chat.timestamp || Date.now() / 1000,
+            };
+            processedChats.push(processedChat);
+          }
           
-          // Extract successful results
-          const successfulResults = batchResults
-            .filter(result => result.status === 'fulfilled')
-            .map(result => result.value);
-          
-          processedChats.push(...successfulResults);
-          
-          // Calculate progress with better accuracy
-          const current = Math.min(i + batchSize, totalChats);
-          // حساب progress من 10% إلى 98% (10% للبداية، 98% قبل الإكمال)
+          // حساب progress من 10% إلى 98%
+          const current = i + 1;
           const progress = Math.max(10, Math.min(98, Math.round(10 + ((current / totalChats) * 88))));
           
-          // Emit progress update more frequently for better UX
+          // إرسال الـ progress مع اسم المحادثة الحالية
           const progressData = { 
             status: "processing", 
-            message: `جاري معالجة المحادثات... (${current}/${totalChats})`,
+            message: `جاري مزامنة: ${chatName} (${current}/${totalChats})`,
             progress: progress,
             total: totalChats,
             current: current
           };
           
           socket.emit("syncProgress", progressData);
-          // Also send as volatile to ensure delivery
-          socket.volatile.emit("syncProgress", progressData);
           
-          console.log(`Processed ${current}/${totalChats} chats (${progress}%)`);
+          // إرسال المحادثات المُعالجة حتى الآن فوراً للواجهة
+          socket.emit("chats", processedChats);
           
-          // Smaller delay between batches for better performance
-          if (i + batchSize < chatsToProcess.length) {
-            await new Promise(resolve => setTimeout(resolve, 50));
+          // Log every 10 chats
+          if (current % 10 === 0 || current === totalChats) {
+            console.log(`Processed ${current}/${totalChats} chats (${progress}%)`);
+          }
+          
+          // تأخير صغير جداً لتجنب حظر الـ event loop
+          if (current % 5 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 10));
           }
         }
         
@@ -1046,7 +1041,7 @@ app.prepare().then(() => {
           current: chats.length
         });
         
-        // إرسال المحادثات بعد اكتمال المزامنة
+        // إرسال المحادثات النهائية
         socket.emit("chats", chats);
         
       } catch (error) {
