@@ -1,0 +1,727 @@
+const { createServer } = require("http");
+const { parse } = require("url");
+const next = require("next");
+const { Server } = require("socket.io");
+const { Client, LocalAuth } = require("whatsapp-web.js");
+
+const dev = process.env.NODE_ENV !== "production";
+const hostname = "localhost";
+const port = 3000;
+
+const app = next({ dev, hostname, port });
+const handle = app.getRequestHandler();
+
+// In-memory store for chats
+let chats = [];
+let isReady = false;
+
+// WhatsApp Client
+const whatsappClient = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  },
+});
+
+app.prepare().then(() => {
+  const httpServer = createServer((req, res) => {
+    const parsedUrl = parse(req.url, true);
+    handle(req, res, parsedUrl);
+  });
+
+  const io = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"],
+    },
+  });
+
+  // Socket.io connection
+  io.on("connection", (socket) => {
+    console.log("Client connected:", socket.id);
+
+    // Send current status
+    socket.emit("status", { isReady });
+
+    // Request to fetch chats
+    socket.on("getChats", async () => {
+      if (!isReady) {
+        socket.emit("chatsError", { message: "WhatsApp not ready" });
+        return;
+      }
+
+      // Helper to delay
+      const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+      
+      // Retry function
+      const fetchWithRetry = async (retries = 3) => {
+        for (let i = 0; i < retries; i++) {
+          try {
+            // Check if client info is available
+            const info = whatsappClient.info;
+            if (!info) {
+              console.log("Client info not available, waiting...");
+              await delay(2000);
+              continue;
+            }
+            
+            console.log("Connected as:", info.pushname);
+            
+            // Wait a bit before fetching to ensure WhatsApp is ready
+            if (i === 0) await delay(1000);
+            
+            const allChats = await whatsappClient.getChats();
+            console.log(`Found ${allChats.length} chats`);
+            return allChats;
+          } catch (error) {
+            console.error(`Attempt ${i + 1} failed:`, error.message);
+            if (i < retries - 1) {
+              await delay(2000 * (i + 1)); // Exponential backoff
+            } else {
+              throw error;
+            }
+          }
+        }
+      };
+
+      try {
+        console.log("Fetching chats...");
+        
+        const allChats = await fetchWithRetry(3);
+        if (!allChats) {
+          socket.emit("chatsError", { message: "Failed to fetch chats after retries" });
+          return;
+        }
+        
+        console.log(`Processing ${allChats.length} chats...`);
+        
+        const processedChats = [];
+        
+        for (const chat of allChats.slice(0, 100)) {
+          try {
+            // Get profile picture
+            let profilePic = null;
+            try {
+              profilePic = await chat.getContact().then(c => c.getProfilePicUrl());
+            } catch (e) {
+              // Ignore profile pic errors
+            }
+            
+            // Extract phone number
+            const phoneNumber = chat.id._serialized.split("@")[0];
+            
+            // Get group participants if it's a group
+            let participants = [];
+            if (chat.isGroup) {
+              try {
+                const groupChat = chat;
+                if (groupChat.participants) {
+                  participants = groupChat.participants.map(p => ({
+                    id: p.id._serialized,
+                    name: p.id.user,
+                    isAdmin: p.isAdmin || false,
+                    isSuperAdmin: p.isSuperAdmin || false,
+                  }));
+                }
+              } catch (e) {
+                // Ignore participant errors
+              }
+            }
+            
+            const chatData = {
+              id: chat.id._serialized,
+              name: chat.name || chat.id.user || phoneNumber || "Unknown",
+              phone: phoneNumber,
+              profilePic: profilePic,
+              isGroup: chat.isGroup || false,
+              participants: participants,
+              participantCount: participants.length,
+              unreadCount: chat.unreadCount || 0,
+              lastMessage: null,
+              timestamp: chat.timestamp || Date.now() / 1000,
+            };
+            
+            // Try to get last message safely with sender info and type
+            if (chat.lastMessage) {
+              const msg = chat.lastMessage;
+              let senderName = "أنا";
+              
+              if (!msg.fromMe && chat.isGroup) {
+                try {
+                  const senderId = msg.author || msg.from;
+                  senderName = senderId ? senderId.split("@")[0] : "مجهول";
+                } catch (e) {
+                  senderName = "مجهول";
+                }
+              } else if (!msg.fromMe) {
+                senderName = chat.name || phoneNumber;
+              }
+              
+              // Get message type label
+              const typeLabels = {
+                chat: "نص",
+                image: "صورة 📷",
+                video: "فيديو 🎥",
+                audio: "صوت 🎵",
+                ptt: "رسالة صوتية 🎤",
+                document: "مستند 📄",
+                sticker: "ملصق",
+                location: "موقع 📍",
+                contact: "جهة اتصال 👤",
+                poll_creation: "استطلاع 📊",
+              };
+              
+              chatData.lastMessage = {
+                body: msg.body || typeLabels[msg.type] || "",
+                fromMe: msg.fromMe || false,
+                timestamp: msg.timestamp || Date.now() / 1000,
+                type: msg.type || "chat",
+                typeLabel: typeLabels[msg.type] || "نص",
+                senderName: senderName,
+              };
+            }
+            
+            processedChats.push(chatData);
+          } catch (chatError) {
+            console.error("Error processing single chat:", chatError.message);
+          }
+        }
+        
+        chats = processedChats;
+        console.log(`Processed ${chats.length} chats successfully`);
+        socket.emit("chats", chats);
+        
+      } catch (error) {
+        console.error("Error fetching chats:", error.message, error.stack);
+        socket.emit("chatsError", { message: error.message || "Unknown error" });
+      }
+    });
+
+    // Request to get messages for a specific chat (with media support)
+    socket.on("getMessages", async ({ chatId, limit = 50 }) => {
+      if (!isReady) {
+        socket.emit("messagesError", { message: "WhatsApp not ready" });
+        return;
+      }
+
+      try {
+        const chat = await whatsappClient.getChatById(chatId);
+        const messages = await chat.fetchMessages({ limit });
+        
+        const formattedMessages = await Promise.all(
+          messages.map(async (msg) => {
+            const messageData = {
+              id: msg.id._serialized,
+              body: msg.body,
+              fromMe: msg.fromMe,
+              timestamp: msg.timestamp,
+              type: msg.type,
+              hasMedia: msg.hasMedia || false,
+              mediaUrl: null,
+              mimetype: null,
+              filename: null,
+              duration: null,
+              senderName: null,
+            };
+            
+            // Get sender name for group messages
+            if (!msg.fromMe && chat.isGroup) {
+              try {
+                const contact = await msg.getContact();
+                messageData.senderName = contact.pushname || contact.name || msg.author?.split("@")[0] || "مجهول";
+              } catch (e) {
+                messageData.senderName = msg.author?.split("@")[0] || "مجهول";
+              }
+            }
+            
+            // Fetch media if available
+            if (msg.hasMedia) {
+              try {
+                const media = await msg.downloadMedia();
+                if (media) {
+                  messageData.mediaUrl = `data:${media.mimetype};base64,${media.data}`;
+                  messageData.mimetype = media.mimetype;
+                  messageData.filename = media.filename;
+                }
+              } catch (e) {
+                console.error("Error downloading media:", e.message);
+              }
+            }
+            
+            // Get duration for audio/video
+            if (msg.type === "ptt" || msg.type === "audio") {
+              try {
+                messageData.duration = msg.duration || null;
+              } catch (e) {
+                // Ignore
+              }
+            }
+            
+            return messageData;
+          })
+        );
+        
+        socket.emit("messages", { chatId, messages: formattedMessages });
+      } catch (error) {
+        console.error("Error fetching messages:", error);
+        socket.emit("messagesError", { message: error.message });
+      }
+    });
+
+    // Send message
+    socket.on("sendMessage", async ({ chatId, message }) => {
+      if (!isReady) {
+        socket.emit("sendMessageError", { message: "WhatsApp not ready" });
+        return;
+      }
+
+      if (!chatId || !message) {
+        socket.emit("sendMessageError", { message: "Chat ID and message are required" });
+        return;
+      }
+
+      try {
+        console.log(`Sending message to ${chatId}: ${message.substring(0, 50)}...`);
+        
+        const chat = await whatsappClient.getChatById(chatId);
+        const sentMessage = await chat.sendMessage(message);
+        
+        console.log("Message sent successfully!");
+        
+        socket.emit("messageSent", { 
+          success: true, 
+          chatId,
+          messageId: sentMessage.id._serialized,
+          timestamp: sentMessage.timestamp
+        });
+
+      } catch (error) {
+        console.error("Send message error:", error);
+        socket.emit("sendMessageError", { message: error.message });
+      }
+    });
+
+    // Search messages across all chats
+    socket.on("searchMessages", async ({ query, maxChats = 50, maxMessagesPerChat = 30 }) => {
+      if (!isReady) {
+        socket.emit("searchProgress", { status: "error", message: "واتساب غير جاهز", progress: 0 });
+        socket.emit("searchResults", { results: [], query: "" });
+        return;
+      }
+
+      if (!query || query.trim().length < 2) {
+        socket.emit("searchResults", { results: [], query: "" });
+        return;
+      }
+
+      try {
+        console.log(`Searching for: "${query}"`);
+        
+        socket.emit("searchProgress", { 
+          status: "searching", 
+          message: `جاري البحث عن "${query}"...`,
+          progress: 5
+        });
+
+        let allChats;
+        try {
+          allChats = await whatsappClient.getChats();
+        } catch (e) {
+          console.error("Failed to get chats for search:", e.message);
+          socket.emit("searchProgress", { status: "error", message: "فشل جلب المحادثات", progress: 0 });
+          socket.emit("searchResults", { results: [], query });
+          return;
+        }
+
+        const searchResults = [];
+        const chatsToSearch = allChats.slice(0, maxChats);
+        const queryLower = query.toLowerCase();
+        const totalChats = chatsToSearch.length;
+
+        console.log(`Searching in ${totalChats} chats...`);
+
+        socket.emit("searchProgress", { 
+          status: "searching", 
+          message: `تم العثور على ${allChats.length} محادثة، جاري البحث...`,
+          progress: 10
+        });
+
+        for (let i = 0; i < chatsToSearch.length; i++) {
+          const chat = chatsToSearch[i];
+          
+          try {
+            const messages = await chat.fetchMessages({ limit: maxMessagesPerChat });
+            
+            for (const msg of messages) {
+              if (msg.body && msg.body.toLowerCase().includes(queryLower)) {
+                const phoneNumber = chat.id._serialized.split("@")[0];
+                
+                let senderName = "أنا";
+                if (!msg.fromMe && chat.isGroup) {
+                  senderName = msg.author ? msg.author.split("@")[0] : "مجهول";
+                } else if (!msg.fromMe) {
+                  senderName = chat.name || phoneNumber;
+                }
+                
+                searchResults.push({
+                  id: msg.id._serialized,
+                  chatId: chat.id._serialized,
+                  chatName: chat.name || phoneNumber,
+                  chatPhone: phoneNumber,
+                  isGroup: chat.isGroup || false,
+                  body: msg.body,
+                  timestamp: msg.timestamp,
+                  fromMe: msg.fromMe,
+                  senderName: senderName,
+                  type: msg.type || "chat",
+                });
+              }
+            }
+          } catch (e) {
+            // Skip this chat on error
+            console.log(`Skipping chat ${i + 1} due to error`);
+          }
+
+          // Emit progress every chat
+          const progress = Math.round(10 + ((i + 1) / totalChats) * 85);
+          socket.emit("searchProgress", { 
+            status: "searching", 
+            message: `جاري البحث... (${i + 1}/${totalChats})`,
+            progress: progress
+          });
+        }
+
+        console.log(`Found ${searchResults.length} results for "${query}"`);
+        
+        // Sort by timestamp (newest first)
+        searchResults.sort((a, b) => b.timestamp - a.timestamp);
+        
+        socket.emit("searchProgress", { 
+          status: "completed", 
+          message: `تم العثور على ${searchResults.length} نتيجة`,
+          progress: 100
+        });
+
+        socket.emit("searchResults", { results: searchResults, query });
+
+      } catch (error) {
+        console.error("Search error:", error);
+        socket.emit("searchProgress", { 
+          status: "error", 
+          message: `خطأ: ${error.message}`,
+          progress: 0
+        });
+        socket.emit("searchResults", { results: [], query });
+      }
+    });
+
+    // Logout
+    socket.on("logout", async () => {
+      try {
+        await whatsappClient.logout();
+        isReady = false;
+        io.emit("status", { isReady: false });
+        io.emit("logout");
+      } catch (error) {
+        console.error("Logout error:", error);
+      }
+    });
+
+    // Sync all chats (fetch more chats with progress)
+    socket.on("syncAllChats", async ({ maxChats = 500 } = {}) => {
+      if (!isReady) {
+        socket.emit("chatsError", { message: "WhatsApp not ready" });
+        return;
+      }
+
+      try {
+        console.log("Syncing all chats...");
+        
+        // Emit sync started
+        socket.emit("syncProgress", { 
+          status: "started", 
+          message: "جاري جلب المحادثات...",
+          progress: 0,
+          total: 0,
+          current: 0
+        });
+        
+        const allChats = await whatsappClient.getChats();
+        const totalChats = Math.min(allChats.length, maxChats);
+        console.log(`Found ${allChats.length} chats, processing ${totalChats}...`);
+        
+        socket.emit("syncProgress", { 
+          status: "processing", 
+          message: `تم العثور على ${allChats.length} محادثة، جاري المعالجة...`,
+          progress: 5,
+          total: totalChats,
+          current: 0
+        });
+        
+        const processedChats = [];
+        const chatsToProcess = allChats.slice(0, totalChats);
+        const batchSize = 10; // Process in batches for efficiency
+        
+        // Type labels
+        const typeLabels = {
+          chat: "نص",
+          image: "صورة 📷",
+          video: "فيديو 🎥",
+          audio: "صوت 🎵",
+          ptt: "رسالة صوتية 🎤",
+          document: "مستند 📄",
+          sticker: "ملصق",
+          location: "موقع 📍",
+          contact: "جهة اتصال 👤",
+          poll_creation: "استطلاع 📊",
+        };
+        
+        for (let i = 0; i < chatsToProcess.length; i += batchSize) {
+          const batch = chatsToProcess.slice(i, i + batchSize);
+          
+          // Process batch in parallel
+          const batchResults = await Promise.all(
+            batch.map(async (chat) => {
+              try {
+                const phoneNumber = chat.id._serialized.split("@")[0];
+                
+                // Get profile picture (optional, skip on error)
+                let profilePic = null;
+                try {
+                  const contact = await chat.getContact();
+                  profilePic = await contact.getProfilePicUrl();
+                } catch (e) {
+                  // Skip profile pic on error
+                }
+                
+                // Get participants for groups
+                let participants = [];
+                if (chat.isGroup && chat.participants) {
+                  participants = chat.participants.map(p => ({
+                    id: p.id._serialized,
+                    name: p.id.user,
+                    isAdmin: p.isAdmin || false,
+                    isSuperAdmin: p.isSuperAdmin || false,
+                  }));
+                }
+                
+                // Get last message info
+                let lastMessageData = null;
+                if (chat.lastMessage) {
+                  const msg = chat.lastMessage;
+                  let senderName = "أنا";
+                  
+                  if (!msg.fromMe && chat.isGroup) {
+                    const senderId = msg.author || msg.from;
+                    senderName = senderId ? senderId.split("@")[0] : "مجهول";
+                  } else if (!msg.fromMe) {
+                    senderName = chat.name || phoneNumber;
+                  }
+                  
+                  lastMessageData = {
+                    body: msg.body || typeLabels[msg.type] || "",
+                    fromMe: msg.fromMe || false,
+                    timestamp: msg.timestamp || Date.now() / 1000,
+                    type: msg.type || "chat",
+                    typeLabel: typeLabels[msg.type] || "نص",
+                    senderName: senderName,
+                  };
+                }
+                
+                return {
+                  id: chat.id._serialized,
+                  name: chat.name || chat.id.user || phoneNumber || "Unknown",
+                  phone: phoneNumber,
+                  profilePic: profilePic,
+                  isGroup: chat.isGroup || false,
+                  participants: participants,
+                  participantCount: participants.length,
+                  unreadCount: chat.unreadCount || 0,
+                  lastMessage: lastMessageData,
+                  timestamp: chat.timestamp || Date.now() / 1000,
+                };
+              } catch (e) {
+                // Return minimal data on error
+                return {
+                  id: chat.id._serialized,
+                  name: chat.name || chat.id.user || "Unknown",
+                  phone: chat.id._serialized.split("@")[0],
+                  profilePic: null,
+                  isGroup: chat.isGroup || false,
+                  participants: [],
+                  participantCount: 0,
+                  unreadCount: 0,
+                  lastMessage: null,
+                  timestamp: chat.timestamp || Date.now() / 1000,
+                };
+              }
+            })
+          );
+          
+          processedChats.push(...batchResults);
+          
+          // Calculate progress
+          const current = Math.min(i + batchSize, totalChats);
+          const progress = Math.round((current / totalChats) * 100);
+          
+          // Emit progress update
+          socket.emit("syncProgress", { 
+            status: "processing", 
+            message: `جاري معالجة المحادثات... (${current}/${totalChats})`,
+            progress: progress,
+            total: totalChats,
+            current: current
+          });
+          
+          console.log(`Processed ${current}/${totalChats} chats (${progress}%)`);
+          
+          // Small delay between batches to avoid overloading
+          if (i + batchSize < chatsToProcess.length) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+        
+        chats = processedChats;
+        console.log(`Synced ${chats.length} chats successfully`);
+        
+        // Emit completion
+        socket.emit("syncProgress", { 
+          status: "completed", 
+          message: `تم مزامنة ${chats.length} محادثة بنجاح!`,
+          progress: 100,
+          total: chats.length,
+          current: chats.length
+        });
+        
+        socket.emit("chats", chats);
+        
+      } catch (error) {
+        console.error("Error syncing chats:", error);
+        socket.emit("syncProgress", { 
+          status: "error", 
+          message: `حدث خطأ: ${error.message}`,
+          progress: 0,
+          total: 0,
+          current: 0
+        });
+        socket.emit("chatsError", { message: error.message });
+      }
+    });
+
+    socket.on("disconnect", () => {
+      console.log("Client disconnected:", socket.id);
+    });
+  });
+
+  // WhatsApp events
+  whatsappClient.on("qr", (qr) => {
+    console.log("QR Code received");
+    io.emit("qr", qr);
+  });
+
+  whatsappClient.on("ready", () => {
+    console.log("WhatsApp client is ready!");
+    isReady = true;
+    io.emit("status", { isReady: true });
+    io.emit("ready");
+  });
+
+  whatsappClient.on("authenticated", () => {
+    console.log("WhatsApp client authenticated");
+  });
+
+  whatsappClient.on("auth_failure", (msg) => {
+    console.error("Auth failure:", msg);
+    io.emit("authFailure", { message: msg });
+  });
+
+  whatsappClient.on("disconnected", (reason) => {
+    console.log("WhatsApp disconnected:", reason);
+    isReady = false;
+    io.emit("status", { isReady: false });
+    io.emit("disconnected", { reason });
+  });
+
+  whatsappClient.on("message", async (message) => {
+    console.log("New message received from:", message.from);
+    
+    // Get sender info
+    let senderName = "مجهول";
+    let senderPhone = message.from.split("@")[0];
+    
+    try {
+      const contact = await message.getContact();
+      senderName = contact.pushname || contact.name || senderPhone;
+    } catch (e) {
+      // Ignore contact errors
+    }
+    
+    // Get message type label
+    const typeLabels = {
+      chat: "نص",
+      image: "صورة 📷",
+      video: "فيديو 🎥",
+      audio: "صوت 🎵",
+      ptt: "رسالة صوتية 🎤",
+      document: "مستند 📄",
+      sticker: "ملصق",
+      location: "موقع 📍",
+      contact: "جهة اتصال 👤",
+      poll_creation: "استطلاع 📊",
+    };
+    
+    io.emit("newMessage", {
+      id: message.id._serialized,
+      body: message.body || typeLabels[message.type] || "",
+      fromMe: message.fromMe,
+      from: message.from,
+      chatId: message.from,
+      timestamp: message.timestamp,
+      type: message.type,
+      typeLabel: typeLabels[message.type] || "نص",
+      senderName: senderName,
+      senderPhone: senderPhone,
+    });
+  });
+
+  // Also listen for outgoing messages
+  whatsappClient.on("message_create", async (message) => {
+    if (message.fromMe) {
+      console.log("Message sent to:", message.to);
+      
+      const typeLabels = {
+        chat: "نص",
+        image: "صورة 📷",
+        video: "فيديو 🎥",
+        audio: "صوت 🎵",
+        ptt: "رسالة صوتية 🎤",
+        document: "مستند 📄",
+        sticker: "ملصق",
+        location: "موقع 📍",
+        contact: "جهة اتصال 👤",
+        poll_creation: "استطلاع 📊",
+      };
+      
+      io.emit("newMessage", {
+        id: message.id._serialized,
+        body: message.body || typeLabels[message.type] || "",
+        fromMe: true,
+        from: message.to,
+        chatId: message.to,
+        timestamp: message.timestamp,
+        type: message.type,
+        typeLabel: typeLabels[message.type] || "نص",
+        senderName: "أنا",
+        senderPhone: "",
+      });
+    }
+  });
+
+  // Initialize WhatsApp client
+  whatsappClient.initialize();
+
+  httpServer.listen(port, () => {
+    console.log(`> Ready on http://${hostname}:${port}`);
+  });
+});
