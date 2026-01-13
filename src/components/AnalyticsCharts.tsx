@@ -644,16 +644,16 @@ export default function AnalyticsCharts() {
 
       {/* Response Time Analysis Table */}
       <ChartCard title="تحليل وقت الرد لكل محادثة" className="col-span-full">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm" style={{ minWidth: '800px' }}>
+        <div className="overflow-x-auto" dir="rtl">
+          <table className="w-full text-sm" style={{ minWidth: '900px' }}>
             <thead>
               <tr className="border-b border-gray-700 bg-gray-800/30">
-                <th className="text-center py-4 px-3 text-gray-300 font-semibold w-12">#</th>
-                <th className="text-right py-4 px-4 text-gray-300 font-semibold min-w-[200px]">اسم المحادثة</th>
-                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-24">النوع</th>
-                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-32">منذ متى</th>
-                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-32">الحالة</th>
-                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-24">غير مقروء</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold" style={{ width: '60px' }}>#</th>
+                <th className="text-right py-4 px-4 text-gray-300 font-semibold" style={{ minWidth: '220px' }}>اسم المحادثة</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold" style={{ width: '100px' }}>النوع</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold" style={{ width: '120px' }}>منذ متى</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold" style={{ width: '130px' }}>الحالة</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold" style={{ width: '100px' }}>غير مقروء</th>
               </tr>
             </thead>
             <tbody>
