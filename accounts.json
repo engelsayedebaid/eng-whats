@@ -4,11 +4,5 @@
     "name": "حساب 1",
     "phone": "201065201900",
     "isActive": true
-  },
-  {
-    "id": "account_1768309513636",
-    "name": "test",
-    "phone": "201022448868",
-    "isActive": false
   }
 ]

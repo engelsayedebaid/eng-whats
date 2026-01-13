@@ -1080,9 +1080,41 @@ app.prepare().then(() => {
         return;
       }
       
-      // Don't switch if already on this account
+      // Don't switch if already on this account AND client is ready
       if (currentAccountId === accountId) {
-        console.log("Already on this account");
+        const existingClient = whatsappClients.get(accountId);
+        const isClientReady = clientReadyStates.get(accountId);
+        
+        if (existingClient && isClientReady) {
+          console.log("Already on this account and client is ready");
+          socket.emit("currentAccount", currentAccountId);
+          socket.emit("accounts", accounts);
+          io.emit("status", { isReady: true });
+          return;
+        }
+        
+        // Client not ready, need to initialize
+        console.log("Already on this account but client not ready, initializing...");
+        
+        isReady = false;
+        chats = [];
+        io.emit("status", { isReady: false });
+        io.emit("qrCleared");
+        
+        let client = existingClient;
+        if (!client) {
+          client = createWhatsAppClient(accountId);
+          whatsappClients.set(accountId, client);
+          setupClientEvents(client, accountId);
+        }
+        
+        whatsappClient = client;
+        
+        try {
+          await client.initialize();
+        } catch (error) {
+          console.error(`Failed to initialize account ${accountId}:`, error.message);
+        }
         return;
       }
       
@@ -1200,6 +1232,75 @@ app.prepare().then(() => {
       console.log("Account deleted successfully");
       socket.emit("accounts", accounts);
       socket.emit("currentAccount", currentAccountId);
+    });
+
+    // Clear all sessions and start fresh
+    socket.on("clearSessions", async () => {
+      console.log("Clearing all sessions...");
+      
+      try {
+        // Stop and destroy all WhatsApp clients
+        for (const [accountId, client] of whatsappClients.entries()) {
+          try {
+            console.log(`Destroying client for account: ${accountId}`);
+            await client.destroy();
+          } catch (e) {
+            console.error(`Error destroying client ${accountId}:`, e.message);
+          }
+        }
+        
+        // Clear all maps
+        whatsappClients.clear();
+        clientReadyStates.clear();
+        
+        // Clear session directories
+        const authPath = path.join(__dirname, ".wwebjs_auth");
+        const cachePath = path.join(__dirname, ".wwebjs_cache");
+        
+        if (fs.existsSync(authPath)) {
+          console.log("Removing auth directory...");
+          fs.rmSync(authPath, { recursive: true, force: true });
+        }
+        
+        if (fs.existsSync(cachePath)) {
+          console.log("Removing cache directory...");
+          fs.rmSync(cachePath, { recursive: true, force: true });
+        }
+        
+        // Reset state
+        isReady = false;
+        chats = [];
+        whatsappClient = null;
+        
+        // Reset accounts to default
+        accounts = [{
+          id: `account_${Date.now()}`,
+          name: "حساب 1",
+          phone: null,
+          isActive: true
+        }];
+        currentAccountId = accounts[0].id;
+        saveAccounts(accounts);
+        
+        console.log("All sessions cleared successfully!");
+        
+        // Notify clients
+        io.emit("sessionsCleared", { success: true });
+        io.emit("accounts", accounts);
+        io.emit("currentAccount", currentAccountId);
+        io.emit("status", { isReady: false });
+        io.emit("qrCleared");
+        
+        // Reinitialize with fresh account
+        setTimeout(() => {
+          console.log("Reinitializing with fresh account...");
+          initializeAccount(currentAccountId);
+        }, 2000);
+        
+      } catch (error) {
+        console.error("Error clearing sessions:", error);
+        socket.emit("sessionsCleared", { success: false, error: error.message });
+      }
     });
 
     socket.on("disconnect", () => {
