@@ -69,8 +69,11 @@ const whatsappClient = new Client({
       "--disable-blink-features=AutomationControlled",
     ],
     // Add timeout and ignore errors
-    timeout: 60000,
+    timeout: 0, // No timeout for page load
     ignoreHTTPSErrors: true,
+    // Increase protocol timeout significantly to prevent Runtime.callFunctionOn timeout
+    // Set to very high value (1 hour) for large number of chats - no limit
+    protocolTimeout: 3600000, // 1 hour (3600000ms) - effectively unlimited
   },
 });
 
@@ -542,16 +545,26 @@ app.prepare().then(() => {
         
         let allChats;
         try {
-          // إضافة timeout لـ getChats (30 ثانية)
-          const getChatsPromise = whatsappClient.getChats();
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Timeout: جلب المحادثات استغرق وقتاً طويلاً")), 30000)
-          );
+          // جلب المحادثات بدون timeout - يعمل حتى مع عدد كبير جداً من المحادثات
+          console.log("Fetching chats (no timeout - will wait as long as needed)...");
           
-          allChats = await Promise.race([getChatsPromise, timeoutPromise]);
+          // تحديث progress message
+          socket.emit("syncProgress", { 
+            status: "started", 
+            message: "جاري جلب المحادثات... (قد يستغرق وقتاً مع عدد كبير من المحادثات)",
+            progress: 5,
+            total: 0,
+            current: 0
+          });
+          
+          // جلب المحادثات بدون timeout - سينتظر حتى يكتمل
+          allChats = await whatsappClient.getChats();
+          
+          console.log(`Successfully got ${allChats.length} chats`);
+          
         } catch (error) {
           clearInterval(progressInterval);
-          console.error("Error getting chats:", error);
+          console.error("Error getting chats after all retries:", error);
           socket.emit("syncProgress", { 
             status: "error", 
             message: `خطأ في جلب المحادثات: ${error.message}`,
