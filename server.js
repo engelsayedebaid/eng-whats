@@ -3,6 +3,8 @@ const { parse } = require("url");
 const next = require("next");
 const { Server } = require("socket.io");
 const { Client, LocalAuth } = require("whatsapp-web.js");
+const fs = require("fs");
+const path = require("path");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
@@ -15,14 +17,52 @@ const handle = app.getRequestHandler();
 let chats = [];
 let isReady = false;
 
+// Accounts management
+const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
+let currentAccountId = null;
+
+// Load accounts from file
+const loadAccounts = () => {
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) {
+      const data = fs.readFileSync(ACCOUNTS_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error("Error loading accounts:", e.message);
+  }
+  // Return default account if file doesn't exist or has error
+  const defaultAccount = {
+    id: `account_${Date.now()}`,
+    name: "حساب 1",
+    phone: null,
+    isActive: true
+  };
+  saveAccounts([defaultAccount]);
+  return [defaultAccount];
+};
+
+// Save accounts to file
+const saveAccounts = (accounts) => {
+  try {
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), "utf8");
+    console.log("Accounts saved successfully");
+  } catch (e) {
+    console.error("Error saving accounts:", e.message);
+  }
+};
+
+// Initialize accounts
+let accounts = loadAccounts();
+// Set current account to the active one or first
+currentAccountId = accounts.find(a => a.isActive)?.id || accounts[0]?.id;
+
 // Find Chromium executable path
 const getChromiumPath = () => {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-  const fs = require('fs');
   const os = require('os');
-  const path = require('path');
   
   // Windows paths
   if (os.platform() === 'win32') {
@@ -51,31 +91,50 @@ const getChromiumPath = () => {
   return undefined; // Use bundled Chromium
 };
 
-// WhatsApp Client
-const whatsappClient = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    executablePath: getChromiumPath(),
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--disable-gpu",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-blink-features=AutomationControlled",
-    ],
-    // Add timeout and ignore errors
-    timeout: 0, // No timeout for page load
-    ignoreHTTPSErrors: true,
-    // Increase protocol timeout significantly to prevent Runtime.callFunctionOn timeout
-    // Set to very high value (1 hour) for large number of chats - no limit
-    protocolTimeout: 3600000, // 1 hour (3600000ms) - effectively unlimited
-  },
-});
+// Store for WhatsApp clients - each account has its own client
+const whatsappClients = new Map();
+// Track ready state for each client
+const clientReadyStates = new Map();
+
+
+// Create WhatsApp client for a specific account
+const createWhatsAppClient = (accountId) => {
+  console.log(`Creating WhatsApp client for account: ${accountId}`);
+  
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: accountId }),
+    puppeteer: {
+      headless: true,
+      executablePath: getChromiumPath(),
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--no-first-run",
+        "--disable-gpu",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      timeout: 0,
+      ignoreHTTPSErrors: true,
+      protocolTimeout: 3600000,
+    },
+  });
+  
+  return client;
+};
+
+// Get current WhatsApp client
+const getCurrentClient = () => {
+  if (!currentAccountId) return null;
+  return whatsappClients.get(currentAccountId);
+};
+
+// Current client reference (for compatibility)
+let whatsappClient = null;
+
 
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => {
@@ -90,12 +149,190 @@ app.prepare().then(() => {
     },
   });
 
+  // Setup WhatsApp client events
+  const setupClientEvents = (client, accountId) => {
+    client.on("qr", (qr) => {
+      console.log(`QR Code received for account: ${accountId}`);
+      if (currentAccountId === accountId) {
+        io.emit("qr", qr);
+      }
+    });
+
+    client.on("ready", () => {
+      console.log(`WhatsApp client is ready for account: ${accountId}!`);
+      // Mark this client as ready
+      clientReadyStates.set(accountId, true);
+      
+      if (currentAccountId === accountId) {
+        isReady = true;
+        // Update account phone number
+        try {
+          const info = client.info;
+          if (info && info.wid) {
+            const phoneNumber = info.wid.user;
+            const accountIndex = accounts.findIndex(a => a.id === accountId);
+            if (accountIndex !== -1) {
+              accounts[accountIndex].phone = phoneNumber;
+              saveAccounts(accounts);
+              io.emit("accounts", accounts);
+            }
+          }
+        } catch (e) {
+          console.error("Error getting client info:", e.message);
+        }
+        io.emit("status", { isReady: true });
+        io.emit("ready");
+      }
+    });
+
+
+    client.on("authenticated", () => {
+      console.log(`WhatsApp client authenticated for account: ${accountId}`);
+    });
+
+    client.on("auth_failure", (msg) => {
+      console.error(`Auth failure for account ${accountId}:`, msg);
+      if (currentAccountId === accountId) {
+        io.emit("authFailure", { message: msg });
+      }
+    });
+
+    client.on("disconnected", (reason) => {
+      console.log(`WhatsApp disconnected for account ${accountId}:`, reason);
+      // Mark this client as not ready
+      clientReadyStates.set(accountId, false);
+      
+      if (currentAccountId === accountId) {
+        isReady = false;
+        io.emit("status", { isReady: false });
+        io.emit("disconnected", { reason });
+      }
+    });
+
+
+    client.on("message", async (message) => {
+      if (currentAccountId !== accountId) return;
+      
+      console.log("New message received from:", message.from);
+      
+      let senderName = "مجهول";
+      let senderPhone = message.from.split("@")[0];
+      
+      try {
+        const contact = await message.getContact();
+        senderName = contact.pushname || contact.name || senderPhone;
+      } catch (e) {}
+      
+      const typeLabels = {
+        chat: "نص",
+        image: "صورة 📷",
+        video: "فيديو 🎥",
+        audio: "صوت 🎵",
+        ptt: "رسالة صوتية 🎤",
+        document: "مستند 📄",
+        sticker: "ملصق",
+        location: "موقع 📍",
+        contact: "جهة اتصال 👤",
+        poll_creation: "استطلاع 📊",
+      };
+      
+      io.emit("newMessage", {
+        id: message.id._serialized,
+        body: message.body || typeLabels[message.type] || "",
+        fromMe: message.fromMe,
+        from: message.from,
+        chatId: message.from,
+        timestamp: message.timestamp,
+        type: message.type,
+        typeLabel: typeLabels[message.type] || "نص",
+        senderName: senderName,
+        senderPhone: senderPhone,
+      });
+    });
+
+    client.on("message_create", async (message) => {
+      if (currentAccountId !== accountId) return;
+      
+      if (message.fromMe) {
+        console.log("Message sent to:", message.to);
+        
+        const typeLabels = {
+          chat: "نص",
+          image: "صورة 📷",
+          video: "فيديو 🎥",
+          audio: "صوت 🎵",
+          ptt: "رسالة صوتية 🎤",
+          document: "مستند 📄",
+          sticker: "ملصق",
+          location: "موقع 📍",
+          contact: "جهة اتصال 👤",
+          poll_creation: "استطلاع 📊",
+        };
+        
+        io.emit("newMessage", {
+          id: message.id._serialized,
+          body: message.body || typeLabels[message.type] || "",
+          fromMe: true,
+          from: message.to,
+          chatId: message.to,
+          timestamp: message.timestamp,
+          type: message.type,
+          typeLabel: typeLabels[message.type] || "نص",
+          senderName: "أنا",
+          senderPhone: "",
+        });
+      }
+    });
+
+    client.on("error", (error) => {
+      console.error(`WhatsApp client error for account ${accountId}:`, error);
+      if (error.message && error.message.includes('Target closed')) {
+        console.log('Browser target closed, attempting to reinitialize...');
+        setTimeout(() => {
+          if (currentAccountId === accountId && !isReady) {
+            console.log('Reinitializing WhatsApp client...');
+            client.initialize().catch(err => {
+              console.error('Failed to reinitialize:', err.message);
+            });
+          }
+        }, 5000);
+      }
+    });
+  };
+
+  // Initialize or switch to account
+  const initializeAccount = async (accountId) => {
+    console.log(`Initializing account: ${accountId}`);
+    
+    isReady = false;
+    chats = [];
+    io.emit("status", { isReady: false });
+    io.emit("qrCleared");
+    
+    let client = whatsappClients.get(accountId);
+    
+    if (!client) {
+      client = createWhatsAppClient(accountId);
+      whatsappClients.set(accountId, client);
+      setupClientEvents(client, accountId);
+    }
+    
+    whatsappClient = client;
+    
+    try {
+      await client.initialize();
+    } catch (error) {
+      console.error(`Failed to initialize account ${accountId}:`, error.message);
+    }
+  };
+
   // Socket.io connection
   io.on("connection", (socket) => {
     console.log("Client connected:", socket.id);
 
     // Send current status
     socket.emit("status", { isReady });
+
 
     // Request to fetch chats
     socket.on("getChats", async () => {
@@ -786,119 +1023,180 @@ app.prepare().then(() => {
       }
     });
 
+    // ==================== Account Management ====================
+    
+    // Get all accounts
+    socket.on("getAccounts", () => {
+      console.log("Getting accounts...");
+      socket.emit("accounts", accounts);
+      socket.emit("currentAccount", currentAccountId);
+    });
+
+    // Add new account
+    socket.on("addAccount", ({ name }) => {
+      console.log("Adding new account:", name);
+      
+      if (!name || !name.trim()) {
+        console.log("Account name is empty, ignoring");
+        return;
+      }
+      
+      const newAccount = {
+        id: `account_${Date.now()}`,
+        name: name.trim(),
+        phone: null,
+        isActive: false
+      };
+      
+      accounts.push(newAccount);
+      saveAccounts(accounts);
+      
+      console.log("Account added successfully:", newAccount.id);
+      socket.emit("accountAdded", newAccount);
+      socket.emit("accounts", accounts);
+    });
+
+    // Switch to different account
+    socket.on("switchAccount", async ({ accountId }) => {
+      console.log("Switching to account:", accountId);
+      
+      const account = accounts.find(a => a.id === accountId);
+      if (!account) {
+        console.log("Account not found:", accountId);
+        return;
+      }
+      
+      // Don't switch if already on this account
+      if (currentAccountId === accountId) {
+        console.log("Already on this account");
+        return;
+      }
+      
+      // Update active state
+      accounts = accounts.map(a => ({
+        ...a,
+        isActive: a.id === accountId
+      }));
+      
+      // Store previous account ID
+      const previousAccountId = currentAccountId;
+      currentAccountId = accountId;
+      saveAccounts(accounts);
+      
+      // Check if client already exists for this account
+
+      let client = whatsappClients.get(accountId);
+      const isClientReady = clientReadyStates.get(accountId);
+      
+      if (client && isClientReady) {
+        // Client exists and is ready, use it directly
+        console.log("Client already authenticated, using existing session");
+        whatsappClient = client;
+        isReady = true;
+        
+        // Update account phone number if available
+        try {
+          const clientInfo = client.info;
+          if (clientInfo && clientInfo.wid) {
+            const phoneNumber = clientInfo.wid.user;
+            const accountIndex = accounts.findIndex(a => a.id === accountId);
+            if (accountIndex !== -1 && accounts[accountIndex].phone !== phoneNumber) {
+              accounts[accountIndex].phone = phoneNumber;
+              saveAccounts(accounts);
+            }
+          }
+        } catch (e) {
+          // Ignore errors getting phone number
+        }
+        
+        // Notify client that we're ready
+        socket.emit("currentAccount", currentAccountId);
+        socket.emit("accounts", accounts);
+        io.emit("status", { isReady: true });
+        io.emit("ready");
+        
+        console.log("Using existing session for account:", account.name);
+        return;
+      }
+      
+      // Client doesn't exist or not ready
+      console.log("Client not ready, initializing...");
+      
+      // Reset state for new/unready account
+
+      isReady = false;
+      chats = [];
+      
+      // Notify client
+      socket.emit("currentAccount", currentAccountId);
+      socket.emit("accounts", accounts);
+      io.emit("status", { isReady: false });
+      io.emit("qrCleared");
+      
+      console.log("Switched to account:", account.name);
+      console.log("Please wait while initializing account session...");
+      
+      if (!client) {
+        // Create new client for this account
+        client = createWhatsAppClient(accountId);
+        whatsappClients.set(accountId, client);
+        // Setup events for the new client
+        setupClientEvents(client, accountId);
+      }
+      
+      // Set as current
+      whatsappClient = client;
+      
+      // Initialize the client (will use saved session if available)
+      try {
+        await client.initialize();
+      } catch (error) {
+        console.error(`Failed to initialize account ${accountId}:`, error.message);
+      }
+    });
+
+
+
+    // Delete account
+    socket.on("deleteAccount", ({ accountId }) => {
+      console.log("Deleting account:", accountId);
+      
+      if (accounts.length <= 1) {
+        console.log("Cannot delete the only account");
+        return;
+      }
+      
+      const accountIndex = accounts.findIndex(a => a.id === accountId);
+      if (accountIndex === -1) {
+        console.log("Account not found:", accountId);
+        return;
+      }
+      
+      const wasActive = accounts[accountIndex].isActive;
+      accounts.splice(accountIndex, 1);
+      
+      // If deleted account was active, set another as active
+      if (wasActive && accounts.length > 0) {
+        accounts[0].isActive = true;
+        currentAccountId = accounts[0].id;
+      }
+      
+      saveAccounts(accounts);
+      
+      console.log("Account deleted successfully");
+      socket.emit("accounts", accounts);
+      socket.emit("currentAccount", currentAccountId);
+    });
+
     socket.on("disconnect", () => {
       console.log("Client disconnected:", socket.id);
     });
-  });
 
-  // WhatsApp events
-  whatsappClient.on("qr", (qr) => {
-    console.log("QR Code received");
-    io.emit("qr", qr);
-  });
-
-  whatsappClient.on("ready", () => {
-    console.log("WhatsApp client is ready!");
-    isReady = true;
-    io.emit("status", { isReady: true });
-    io.emit("ready");
-  });
-
-  whatsappClient.on("authenticated", () => {
-    console.log("WhatsApp client authenticated");
-  });
-
-  whatsappClient.on("auth_failure", (msg) => {
-    console.error("Auth failure:", msg);
-    io.emit("authFailure", { message: msg });
-  });
-
-  whatsappClient.on("disconnected", (reason) => {
-    console.log("WhatsApp disconnected:", reason);
-    isReady = false;
-    io.emit("status", { isReady: false });
-    io.emit("disconnected", { reason });
-  });
-
-  whatsappClient.on("message", async (message) => {
-    console.log("New message received from:", message.from);
-    
-    // Get sender info
-    let senderName = "مجهول";
-    let senderPhone = message.from.split("@")[0];
-    
-    try {
-      const contact = await message.getContact();
-      senderName = contact.pushname || contact.name || senderPhone;
-    } catch (e) {
-      // Ignore contact errors
-    }
-    
-    // Get message type label
-    const typeLabels = {
-      chat: "نص",
-      image: "صورة 📷",
-      video: "فيديو 🎥",
-      audio: "صوت 🎵",
-      ptt: "رسالة صوتية 🎤",
-      document: "مستند 📄",
-      sticker: "ملصق",
-      location: "موقع 📍",
-      contact: "جهة اتصال 👤",
-      poll_creation: "استطلاع 📊",
-    };
-    
-    io.emit("newMessage", {
-      id: message.id._serialized,
-      body: message.body || typeLabels[message.type] || "",
-      fromMe: message.fromMe,
-      from: message.from,
-      chatId: message.from,
-      timestamp: message.timestamp,
-      type: message.type,
-      typeLabel: typeLabels[message.type] || "نص",
-      senderName: senderName,
-      senderPhone: senderPhone,
-    });
-  });
-
-  // Also listen for outgoing messages
-  whatsappClient.on("message_create", async (message) => {
-    if (message.fromMe) {
-      console.log("Message sent to:", message.to);
-      
-      const typeLabels = {
-        chat: "نص",
-        image: "صورة 📷",
-        video: "فيديو 🎥",
-        audio: "صوت 🎵",
-        ptt: "رسالة صوتية 🎤",
-        document: "مستند 📄",
-        sticker: "ملصق",
-        location: "موقع 📍",
-        contact: "جهة اتصال 👤",
-        poll_creation: "استطلاع 📊",
-      };
-      
-      io.emit("newMessage", {
-        id: message.id._serialized,
-        body: message.body || typeLabels[message.type] || "",
-        fromMe: true,
-        from: message.to,
-        chatId: message.to,
-        timestamp: message.timestamp,
-        type: message.type,
-        typeLabel: typeLabels[message.type] || "نص",
-        senderName: "أنا",
-        senderPhone: "",
-      });
-    }
   });
 
   // Error handlers for unhandled rejections
   process.on('unhandledRejection', (error) => {
     console.error('Unhandled Rejection:', error);
-    // Don't crash the server, just log the error
     if (error.message && error.message.includes('Target closed')) {
       console.log('Browser target closed, this is usually harmless');
     }
@@ -906,34 +1204,12 @@ app.prepare().then(() => {
 
   process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    // Don't crash the server, just log the error
   });
 
-  // WhatsApp client error handlers
-  whatsappClient.on("error", (error) => {
-    console.error("WhatsApp client error:", error);
-    // Don't crash, just log
-    if (error.message && error.message.includes('Target closed')) {
-      console.log('Browser target closed, attempting to reinitialize...');
-      // Optionally reinitialize after a delay
-      setTimeout(() => {
-        if (!isReady) {
-          console.log('Reinitializing WhatsApp client...');
-          whatsappClient.initialize().catch(err => {
-            console.error('Failed to reinitialize:', err.message);
-          });
-        }
-      }, 5000);
-    }
-  });
-
-  // Initialize WhatsApp client with error handling
-  whatsappClient.initialize().catch((error) => {
-    console.error("Failed to initialize WhatsApp client:", error);
-    if (error.message && error.message.includes('Target closed')) {
-      console.log('Browser target closed during initialization, this may be temporary');
-    }
-  });
+  // Initialize current account's WhatsApp client
+  if (currentAccountId) {
+    initializeAccount(currentAccountId);
+  }
 
   httpServer.listen(port, () => {
     console.log(`> Ready on http://${hostname}:${port}`);

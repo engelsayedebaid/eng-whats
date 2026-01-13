@@ -84,7 +84,7 @@ export default function AccountDropdown() {
 
       {/* Dropdown Menu */}
       {isOpen && (
-        <div className="absolute bottom-full left-0 right-0 mb-2 bg-[#202c33] rounded-lg shadow-2xl border border-gray-700 overflow-hidden z-50 max-h-96 overflow-y-auto">
+        <div className="absolute top-full left-0 right-0 mt-2 bg-[#202c33] rounded-lg shadow-2xl border border-gray-700 overflow-hidden z-[9999] max-h-80 overflow-y-auto">
           {/* Accounts List */}
           <div className="py-1">
             {accounts.map((account) => (

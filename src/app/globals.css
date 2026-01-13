@@ -17,13 +17,12 @@
 }
 
 /* Numbers should be LTR */
-.ltr-num,
-[dir="ltr"] {
+.ltr-num {
   direction: ltr !important;
-  unicode-bidi: bidi-override !important;
-  text-align: left;
+  unicode-bidi: isolate !important;
   display: inline-block;
 }
+
 
 body {
   background: var(--background);

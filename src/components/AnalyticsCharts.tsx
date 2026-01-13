@@ -664,11 +664,11 @@ export default function AnalyticsCharts() {
                   : null;
 
                 const getTimeLabel = (minutes: number | null) => {
-                  if (minutes === null) return "غير معروف";
-                  if (minutes < 1) return "الآن";
-                  if (minutes < 60) return `${minutes} دقيقة`;
-                  if (minutes < 1440) return `${Math.floor(minutes / 60)} ساعة`;
-                  return `${Math.floor(minutes / 1440)} يوم`;
+                  if (minutes === null) return <span>غير معروف</span>;
+                  if (minutes < 1) return <span>الآن</span>;
+                  if (minutes < 60) return <><span className="ltr-num">{minutes}</span> دقيقة</>;
+                  if (minutes < 1440) return <><span className="ltr-num">{Math.floor(minutes / 60)}</span> ساعة</>;
+                  return <><span className="ltr-num">{Math.floor(minutes / 1440)}</span> يوم</>;
                 };
 
                 const getStatusColor = (fromMe: boolean | undefined) => {
@@ -703,7 +703,7 @@ export default function AnalyticsCharts() {
                         {chat.isGroup ? "مجموعة" : "خاص"}
                       </span>
                     </td>
-                    <td className="py-3 px-4 text-center text-gray-400 ltr-num">
+                    <td className="py-3 px-4 text-center text-gray-400">
                       {getTimeLabel(timeSinceLastMessage)}
                     </td>
                     <td className="py-3 px-4 text-center">
