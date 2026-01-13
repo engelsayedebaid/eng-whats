@@ -2,6 +2,12 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactCompiler: true,
+  // Allow cross-origin requests from Railway domain
+  allowedDevOrigins: [
+    "eng-whats-production-fb3e.up.railway.app",
+    "*.up.railway.app",
+    "localhost:3000",
+  ],
   images: {
     remotePatterns: [
       {

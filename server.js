@@ -146,7 +146,21 @@ app.prepare().then(() => {
     cors: {
       origin: "*",
       methods: ["GET", "POST"],
+      credentials: true,
     },
+    // Allow both transports for maximum compatibility
+    transports: ['polling', 'websocket'],
+    // Allow upgrade from polling to websocket
+    allowUpgrades: true,
+    // Increase ping timeout for slow connections
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    // Connection timeout
+    connectTimeout: 45000,
+    // Max HTTP buffer size for large messages
+    maxHttpBufferSize: 1e8,
+    // Path configuration
+    path: '/socket.io/',
   });
 
   // Setup WhatsApp client events

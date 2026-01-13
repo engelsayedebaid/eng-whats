@@ -144,31 +144,66 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Get backend URL from environment variable or default to current origin
     const backendUrl = process.env.NEXT_PUBLIC_SOCKET_URL || (typeof window !== 'undefined' ? window.location.origin : '');
+
+    console.log("Connecting to Socket.io server at:", backendUrl);
+
     const newSocket = io(backendUrl, {
-      transports: ['websocket', 'polling'],
+      // Start with polling then upgrade to websocket for better compatibility
+      transports: ['polling', 'websocket'],
+      // Allow transport upgrade
+      upgrade: true,
+      // Reconnection settings
       reconnection: true,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: 10,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      // Timeout settings for production
+      timeout: 20000,
+      // Force new connection
+      forceNew: true,
+      // Path must match server configuration
+      path: '/socket.io/',
     });
 
     newSocket.on("connect", () => {
+      console.log("Socket.io connected successfully! Transport:", newSocket.io.engine.transport.name);
       setIsConnected(true);
       setConnectionError(null);
       // Request accounts on connect
       newSocket.emit("getAccounts");
     });
 
-    newSocket.on("disconnect", () => {
+    newSocket.on("disconnect", (reason) => {
+      console.log("Socket.io disconnected. Reason:", reason);
       setIsConnected(false);
-      setConnectionError("انقطع الاتصال بالخادم. يرجى التحقق من اتصال الخادم الخلفي.");
+      if (reason === "io server disconnect") {
+        // Server disconnected, try to reconnect manually
+        newSocket.connect();
+      }
+      setConnectionError("انقطع الاتصال بالخادم. جاري إعادة المحاولة...");
     });
 
     newSocket.on("connect_error", (error) => {
-      console.error("Socket connection error:", error);
+      console.error("Socket connection error:", error.message);
       setConnectionError(
-        `فشل الاتصال بالخادم. تأكد من أن الخادم الخلفي يعمل وأن NEXT_PUBLIC_SOCKET_URL مضبوط بشكل صحيح.`
+        `فشل الاتصال: ${error.message}. جاري إعادة المحاولة...`
       );
       setIsConnected(false);
+    });
+
+    newSocket.io.on("reconnect_attempt", (attempt) => {
+      console.log(`Reconnection attempt ${attempt}...`);
+      setConnectionError(`جاري إعادة الاتصال... (المحاولة ${attempt})`);
+    });
+
+    newSocket.io.on("reconnect", (attempt) => {
+      console.log(`Reconnected after ${attempt} attempts`);
+      setConnectionError(null);
+    });
+
+    newSocket.io.on("reconnect_failed", () => {
+      console.error("Reconnection failed after all attempts");
+      setConnectionError("فشل إعادة الاتصال. يرجى تحديث الصفحة.");
     });
 
     newSocket.on("status", (data: { isReady: boolean }) => {
