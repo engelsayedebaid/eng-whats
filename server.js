@@ -1101,13 +1101,22 @@ app.prepare().then(() => {
         io.emit("status", { isReady: false });
         io.emit("qrCleared");
         
-        let client = existingClient;
-        if (!client) {
-          client = createWhatsAppClient(accountId);
-          whatsappClients.set(accountId, client);
-          setupClientEvents(client, accountId);
+        // Destroy existing client if any to avoid "browser already running" error
+        if (existingClient) {
+          try {
+            console.log("Destroying existing client before reinitializing...");
+            await existingClient.destroy();
+          } catch (e) {
+            console.log("Error destroying client (may already be closed):", e.message);
+          }
+          whatsappClients.delete(accountId);
+          clientReadyStates.delete(accountId);
         }
         
+        // Create fresh client
+        const client = createWhatsAppClient(accountId);
+        whatsappClients.set(accountId, client);
+        setupClientEvents(client, accountId);
         whatsappClient = client;
         
         try {
@@ -1182,20 +1191,29 @@ app.prepare().then(() => {
       console.log("Switched to account:", account.name);
       console.log("Please wait while initializing account session...");
       
-      if (!client) {
-        // Create new client for this account
-        client = createWhatsAppClient(accountId);
-        whatsappClients.set(accountId, client);
-        // Setup events for the new client
-        setupClientEvents(client, accountId);
+      // Destroy existing client if any to avoid "browser already running" error
+      if (client) {
+        try {
+          console.log("Destroying existing client before reinitializing...");
+          await client.destroy();
+        } catch (e) {
+          console.log("Error destroying client:", e.message);
+        }
+        whatsappClients.delete(accountId);
+        clientReadyStates.delete(accountId);
       }
       
+      // Create new client for this account
+      const newClient = createWhatsAppClient(accountId);
+      whatsappClients.set(accountId, newClient);
+      setupClientEvents(newClient, accountId);
+      
       // Set as current
-      whatsappClient = client;
+      whatsappClient = newClient;
       
       // Initialize the client (will use saved session if available)
       try {
-        await client.initialize();
+        await newClient.initialize();
       } catch (error) {
         console.error(`Failed to initialize account ${accountId}:`, error.message);
       }
