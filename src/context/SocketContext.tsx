@@ -140,7 +140,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       if (data.isReady) {
         setQrCode(null);
         setIsLoading(true);
-        setTimeout(() => newSocket.emit("getChats"), 3000);
+        // بدء المزامنة التلقائية بعد 2 ثانية من الاتصال
+        setTimeout(() => {
+          console.log("Starting automatic sync after ready...");
+          newSocket.emit("syncAllChats", {});
+        }, 2000);
       }
     });
 
@@ -153,12 +157,17 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setIsReady(true);
       setQrCode(null);
       setIsLoading(true);
-      setTimeout(() => newSocket.emit("getChats"), 3000);
+      // بدء المزامنة التلقائية بعد 2 ثانية من ready
+      setTimeout(() => {
+        console.log("Starting automatic sync after ready event...");
+        newSocket.emit("syncAllChats", {});
+      }, 2000);
     });
 
     newSocket.on("chats", (data: Chat[]) => {
       setChats(data);
-      setIsLoading(false);
+      // نوقف التحميل فقط إذا لم تكن المزامنة قيد التنفيذ
+      // سيتم التحكم في isLoading من خلال syncProgress handler
     });
 
     newSocket.on("chatsError", () => {
@@ -172,13 +181,20 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
       if (data.status === "started" || data.status === "processing") {
         setIsLoading(true);
-      } else if (data.status === "completed" || data.status === "error") {
-        if (data.status === "error") {
+      } else if (data.status === "completed") {
+        // عند اكتمال المزامنة، نوقف التحميل بعد ثانية
+        setTimeout(() => {
           setIsLoading(false);
-        }
+          // إخفاء رسالة الإكمال بعد 5 ثوان
+          setTimeout(() => {
+            setSyncProgress(defaultSyncProgress);
+          }, 5000);
+        }, 1000);
+      } else if (data.status === "error") {
+        setIsLoading(false);
         setTimeout(() => {
           setSyncProgress(defaultSyncProgress);
-        }, 3000);
+        }, 5000);
       }
     });
 
@@ -259,9 +275,14 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     });
 
     newSocket.on("logout", () => {
+      console.log("Logout event received, clearing all data...");
       setIsReady(false);
       setChats([]);
       setMessages({});
+      setQrCode(null);
+      setIsLoading(false);
+      setSyncProgress(defaultSyncProgress);
+      setSearchState(defaultSearchState);
     });
 
     setSocket(newSocket);
@@ -320,7 +341,18 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   }, [socket, isReady]);
 
   const logout = useCallback(() => {
-    socket?.emit("logout");
+    if (socket) {
+      console.log("Logging out...");
+      socket.emit("logout");
+      // مسح البيانات فوراً في الواجهة
+      setIsReady(false);
+      setChats([]);
+      setMessages({});
+      setQrCode(null);
+      setIsLoading(false);
+      setSyncProgress(defaultSyncProgress);
+      setSearchState(defaultSearchState);
+    }
   }, [socket]);
 
   return (

@@ -20,17 +20,34 @@ const getChromiumPath = () => {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-  // Common paths for Chromium
-  const paths = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-  ];
   const fs = require('fs');
-  for (const p of paths) {
-    if (fs.existsSync(p)) return p;
+  const os = require('os');
+  const path = require('path');
+  
+  // Windows paths
+  if (os.platform() === 'win32') {
+    const winPaths = [
+      path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Chromium', 'Application', 'chrome.exe'),
+    ];
+    for (const p of winPaths) {
+      if (p && fs.existsSync(p)) return p;
+    }
+  } else {
+    // Linux/Mac paths
+    const paths = [
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+    ];
+    for (const p of paths) {
+      if (fs.existsSync(p)) return p;
+    }
   }
+  
   return undefined; // Use bundled Chromium
 };
 
@@ -46,10 +63,14 @@ const whatsappClient = new Client({
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--no-first-run",
-      "--no-zygote",
-      "--single-process",
       "--disable-gpu",
+      "--disable-web-security",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-blink-features=AutomationControlled",
     ],
+    // Add timeout and ignore errors
+    timeout: 60000,
+    ignoreHTTPSErrors: true,
   },
 });
 
@@ -448,17 +469,25 @@ app.prepare().then(() => {
     // Logout
     socket.on("logout", async () => {
       try {
+        console.log("Logout requested...");
         await whatsappClient.logout();
         isReady = false;
+        chats = []; // مسح المحادثات من الذاكرة
         io.emit("status", { isReady: false });
         io.emit("logout");
+        console.log("Logout successful");
       } catch (error) {
         console.error("Logout error:", error);
+        // حتى لو حدث خطأ، نرسل event logout لمسح البيانات في الواجهة
+        isReady = false;
+        chats = [];
+        io.emit("status", { isReady: false });
+        io.emit("logout");
       }
     });
 
     // Sync all chats (fetch more chats with progress)
-    socket.on("syncAllChats", async ({ maxChats = 500 } = {}) => {
+    socket.on("syncAllChats", async ({ maxChats } = {}) => {
       if (!isReady) {
         socket.emit("chatsError", { message: "WhatsApp not ready" });
         return;
@@ -477,20 +506,22 @@ app.prepare().then(() => {
         });
         
         const allChats = await whatsappClient.getChats();
-        const totalChats = Math.min(allChats.length, maxChats);
-        console.log(`Found ${allChats.length} chats, processing ${totalChats}...`);
+        // لا يوجد حد أقصى - معالجة جميع المحادثات
+        const totalChats = maxChats ? Math.min(allChats.length, maxChats) : allChats.length;
+        console.log(`Found ${allChats.length} chats, processing all ${totalChats}...`);
         
         socket.emit("syncProgress", { 
           status: "processing", 
           message: `تم العثور على ${allChats.length} محادثة، جاري المعالجة...`,
-          progress: 5,
+          progress: 2,
           total: totalChats,
           current: 0
         });
         
         const processedChats = [];
         const chatsToProcess = allChats.slice(0, totalChats);
-        const batchSize = 10; // Process in batches for efficiency
+        // زيادة حجم الـ batch لتحسين الأداء
+        const batchSize = 20; // Process in batches for efficiency
         
         // Type labels
         const typeLabels = {
@@ -509,53 +540,69 @@ app.prepare().then(() => {
         for (let i = 0; i < chatsToProcess.length; i += batchSize) {
           const batch = chatsToProcess.slice(i, i + batchSize);
           
-          // Process batch in parallel
-          const batchResults = await Promise.all(
+          // Process batch in parallel with better error handling
+          const batchResults = await Promise.allSettled(
             batch.map(async (chat) => {
               try {
                 const phoneNumber = chat.id._serialized.split("@")[0];
                 
-                // Get profile picture (optional, skip on error)
+                // Get profile picture (optional, skip on error with timeout)
                 let profilePic = null;
                 try {
-                  const contact = await chat.getContact();
-                  profilePic = await contact.getProfilePicUrl();
+                  const contactPromise = chat.getContact();
+                  const contact = await Promise.race([
+                    contactPromise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+                  ]);
+                  const picPromise = contact.getProfilePicUrl();
+                  profilePic = await Promise.race([
+                    picPromise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+                  ]);
                 } catch (e) {
-                  // Skip profile pic on error
+                  // Skip profile pic on error or timeout
                 }
                 
                 // Get participants for groups
                 let participants = [];
                 if (chat.isGroup && chat.participants) {
-                  participants = chat.participants.map(p => ({
-                    id: p.id._serialized,
-                    name: p.id.user,
-                    isAdmin: p.isAdmin || false,
-                    isSuperAdmin: p.isSuperAdmin || false,
-                  }));
+                  try {
+                    participants = chat.participants.map(p => ({
+                      id: p.id._serialized,
+                      name: p.id.user,
+                      isAdmin: p.isAdmin || false,
+                      isSuperAdmin: p.isSuperAdmin || false,
+                    }));
+                  } catch (e) {
+                    // Skip participants on error
+                  }
                 }
                 
                 // Get last message info
                 let lastMessageData = null;
                 if (chat.lastMessage) {
-                  const msg = chat.lastMessage;
-                  let senderName = "أنا";
-                  
-                  if (!msg.fromMe && chat.isGroup) {
-                    const senderId = msg.author || msg.from;
-                    senderName = senderId ? senderId.split("@")[0] : "مجهول";
-                  } else if (!msg.fromMe) {
-                    senderName = chat.name || phoneNumber;
+                  try {
+                    const msg = chat.lastMessage;
+                    let senderName = "أنا";
+                    
+                    if (!msg.fromMe && chat.isGroup) {
+                      const senderId = msg.author || msg.from;
+                      senderName = senderId ? senderId.split("@")[0] : "مجهول";
+                    } else if (!msg.fromMe) {
+                      senderName = chat.name || phoneNumber;
+                    }
+                    
+                    lastMessageData = {
+                      body: msg.body || typeLabels[msg.type] || "",
+                      fromMe: msg.fromMe || false,
+                      timestamp: msg.timestamp || Date.now() / 1000,
+                      type: msg.type || "chat",
+                      typeLabel: typeLabels[msg.type] || "نص",
+                      senderName: senderName,
+                    };
+                  } catch (e) {
+                    // Skip last message on error
                   }
-                  
-                  lastMessageData = {
-                    body: msg.body || typeLabels[msg.type] || "",
-                    fromMe: msg.fromMe || false,
-                    timestamp: msg.timestamp || Date.now() / 1000,
-                    type: msg.type || "chat",
-                    typeLabel: typeLabels[msg.type] || "نص",
-                    senderName: senderName,
-                  };
                 }
                 
                 return {
@@ -588,13 +635,18 @@ app.prepare().then(() => {
             })
           );
           
-          processedChats.push(...batchResults);
+          // Extract successful results
+          const successfulResults = batchResults
+            .filter(result => result.status === 'fulfilled')
+            .map(result => result.value);
           
-          // Calculate progress
+          processedChats.push(...successfulResults);
+          
+          // Calculate progress with better accuracy
           const current = Math.min(i + batchSize, totalChats);
-          const progress = Math.round((current / totalChats) * 100);
+          const progress = Math.max(2, Math.min(98, Math.round((current / totalChats) * 98)));
           
-          // Emit progress update
+          // Emit progress update more frequently for better UX
           socket.emit("syncProgress", { 
             status: "processing", 
             message: `جاري معالجة المحادثات... (${current}/${totalChats})`,
@@ -605,24 +657,25 @@ app.prepare().then(() => {
           
           console.log(`Processed ${current}/${totalChats} chats (${progress}%)`);
           
-          // Small delay between batches to avoid overloading
+          // Smaller delay between batches for better performance
           if (i + batchSize < chatsToProcess.length) {
-            await new Promise(resolve => setTimeout(resolve, 100));
+            await new Promise(resolve => setTimeout(resolve, 50));
           }
         }
         
         chats = processedChats;
         console.log(`Synced ${chats.length} chats successfully`);
         
-        // Emit completion
+        // Emit completion with success message
         socket.emit("syncProgress", { 
           status: "completed", 
-          message: `تم مزامنة ${chats.length} محادثة بنجاح!`,
+          message: `✅ تم مزامنة ${chats.length} محادثة بنجاح!`,
           progress: 100,
           total: chats.length,
           current: chats.length
         });
         
+        // إرسال المحادثات بعد اكتمال المزامنة
         socket.emit("chats", chats);
         
       } catch (error) {
@@ -747,8 +800,45 @@ app.prepare().then(() => {
     }
   });
 
-  // Initialize WhatsApp client
-  whatsappClient.initialize();
+  // Error handlers for unhandled rejections
+  process.on('unhandledRejection', (error) => {
+    console.error('Unhandled Rejection:', error);
+    // Don't crash the server, just log the error
+    if (error.message && error.message.includes('Target closed')) {
+      console.log('Browser target closed, this is usually harmless');
+    }
+  });
+
+  process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    // Don't crash the server, just log the error
+  });
+
+  // WhatsApp client error handlers
+  whatsappClient.on("error", (error) => {
+    console.error("WhatsApp client error:", error);
+    // Don't crash, just log
+    if (error.message && error.message.includes('Target closed')) {
+      console.log('Browser target closed, attempting to reinitialize...');
+      // Optionally reinitialize after a delay
+      setTimeout(() => {
+        if (!isReady) {
+          console.log('Reinitializing WhatsApp client...');
+          whatsappClient.initialize().catch(err => {
+            console.error('Failed to reinitialize:', err.message);
+          });
+        }
+      }, 5000);
+    }
+  });
+
+  // Initialize WhatsApp client with error handling
+  whatsappClient.initialize().catch((error) => {
+    console.error("Failed to initialize WhatsApp client:", error);
+    if (error.message && error.message.includes('Target closed')) {
+      console.log('Browser target closed during initialization, this may be temporary');
+    }
+  });
 
   httpServer.listen(port, () => {
     console.log(`> Ready on http://${hostname}:${port}`);

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useSocket } from "@/context/SocketContext";
 import {
   MessageCircle,
@@ -13,6 +13,7 @@ import {
   X,
   Wifi,
   WifiOff,
+  Heart,
 } from "lucide-react";
 import ExportButton from "./ExportButton";
 
@@ -23,6 +24,7 @@ const navItems = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const { isConnected, isReady, logout } = useSocket();
   const [isOpen, setIsOpen] = useState(false);
 
@@ -107,13 +109,40 @@ export default function Sidebar() {
               onClick={() => {
                 logout();
                 setIsOpen(false);
+                // إعادة التوجيه إلى الصفحة الرئيسية بعد logout
+                setTimeout(() => {
+                  router.push("/");
+                }, 500);
               }}
-              className="flex items-center gap-3 px-4 py-3 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
+              className="flex items-center gap-3 px-4 py-3 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors w-full"
             >
               <LogOut className="w-5 h-5" />
               تسجيل الخروج
             </button>
           )}
+
+          {/* Version & Credits */}
+          <div className="mt-auto pt-4 border-t border-gray-700/50">
+            <div className="flex flex-col items-center gap-2 text-center">
+              {/* Made with love */}
+              <div className="flex items-center gap-1.5 text-xs text-gray-400">
+                <span>صنع بحب بواسطه</span>
+                <Heart className="w-3.5 h-3.5 text-red-500 fill-red-500 animate-pulse" />
+              </div>
+              <a
+                href="https://github.com/eng.elsayedebaid"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-green-400 hover:text-green-300 transition-colors font-medium"
+              >
+                eng.elsayedebaid
+              </a>
+              {/* Version */}
+              <div className="text-xs text-gray-500 mt-1">
+                v0.1.0
+              </div>
+            </div>
+          </div>
         </div>
       </aside>
     </>
