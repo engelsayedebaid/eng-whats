@@ -641,6 +641,97 @@ export default function AnalyticsCharts() {
           </div>
         </div>
       </div>
+
+      {/* Response Time Analysis Table */}
+      <ChartCard title="تحليل وقت الرد لكل محادثة" className="col-span-full">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm" style={{ minWidth: '800px' }}>
+            <thead>
+              <tr className="border-b border-gray-700 bg-gray-800/30">
+                <th className="text-center py-4 px-3 text-gray-300 font-semibold w-12">#</th>
+                <th className="text-right py-4 px-4 text-gray-300 font-semibold min-w-[200px]">اسم المحادثة</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-24">النوع</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-32">منذ متى</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-32">الحالة</th>
+                <th className="text-center py-4 px-4 text-gray-300 font-semibold w-24">غير مقروء</th>
+              </tr>
+            </thead>
+            <tbody>
+              {chats.slice(0, 20).map((chat, index) => {
+                const lastMessageTime = chat.lastMessage?.timestamp || chat.timestamp;
+                const timeSinceLastMessage = lastMessageTime
+                  ? Math.floor((Date.now() / 1000 - lastMessageTime) / 60)
+                  : null;
+
+                const getTimeLabel = (minutes: number | null) => {
+                  if (minutes === null) return "غير معروف";
+                  if (minutes < 1) return "الآن";
+                  if (minutes < 60) return `${minutes} دقيقة`;
+                  if (minutes < 1440) return `${Math.floor(minutes / 60)} ساعة`;
+                  return `${Math.floor(minutes / 1440)} يوم`;
+                };
+
+                const getStatusColor = (fromMe: boolean | undefined) => {
+                  if (fromMe === true) return "bg-green-500/20 text-green-400";
+                  if (fromMe === false) return "bg-orange-500/20 text-orange-400";
+                  return "bg-gray-500/20 text-gray-400";
+                };
+
+                const getStatusLabel = (fromMe: boolean | undefined) => {
+                  if (fromMe === true) return "تم الرد ✓";
+                  if (fromMe === false) return "بانتظار الرد";
+                  return "غير معروف";
+                };
+
+                return (
+                  <tr
+                    key={chat.id}
+                    className="border-b border-gray-700/50 hover:bg-gray-800/30 transition-colors"
+                  >
+                    <td className="py-3 px-3 text-center text-gray-500 ltr-num">{index + 1}</td>
+                    <td className="py-3 px-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-green-500 to-teal-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                          {chat.name?.charAt(0) || "?"}
+                        </div>
+                        <span className="text-white font-medium">{chat.name}</span>
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      <span className={`px-3 py-1.5 rounded-full text-xs font-medium ${chat.isGroup ? "bg-cyan-500/20 text-cyan-400" : "bg-purple-500/20 text-purple-400"
+                        }`}>
+                        {chat.isGroup ? "مجموعة" : "خاص"}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-center text-gray-400 ltr-num">
+                      {getTimeLabel(timeSinceLastMessage)}
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      <span className={`px-3 py-1.5 rounded-full text-xs font-medium ${getStatusColor(chat.lastMessage?.fromMe)}`}>
+                        {getStatusLabel(chat.lastMessage?.fromMe)}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      {chat.unreadCount > 0 ? (
+                        <span className="bg-red-500/20 text-red-400 px-3 py-1.5 rounded-full text-xs font-medium ltr-num">
+                          {chat.unreadCount}
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {chats.length > 20 && (
+            <p className="text-center text-gray-500 mt-4 text-sm">
+              يتم عرض أول 20 محادثة من إجمالي {chats.length} محادثة
+            </p>
+          )}
+        </div>
+      </ChartCard>
     </div>
   );
 }

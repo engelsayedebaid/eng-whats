@@ -6,7 +6,7 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -15,12 +15,41 @@ const handle = app.getRequestHandler();
 let chats = [];
 let isReady = false;
 
+// Find Chromium executable path
+const getChromiumPath = () => {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  // Common paths for Chromium
+  const paths = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+  const fs = require('fs');
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined; // Use bundled Chromium
+};
+
 // WhatsApp Client
 const whatsappClient = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath: getChromiumPath(),
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+      "--disable-gpu",
+    ],
   },
 });
 
