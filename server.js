@@ -107,26 +107,14 @@ const createWhatsAppClient = (accountId) => {
         "--disable-hang-monitor",
         "--disable-popup-blocking",
         "--disable-prompt-on-repost",
-        "--disable-component-update",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
         "--metrics-recording-only",
         "--no-default-browser-check",
-        "--autoplay-policy=user-gesture-required",
-        "--disable-component-extensions-with-background-pages",
-        "--enable-features=NetworkService,NetworkServiceInProcess",
-        "--force-color-profile=srgb",
-        "--single-process",
       ],
-      timeout: 60000, // 60 ثانية timeout بدلاً من 0
+      timeout: 60000,
       ignoreHTTPSErrors: true,
-      protocolTimeout: 120000, // 2 دقيقة بدلاً من ساعة
+      protocolTimeout: 180000,
     },
-    // تحسينات إضافية للـ WhatsApp client
     qrMaxRetries: 5,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 0,
   });
 };
 
