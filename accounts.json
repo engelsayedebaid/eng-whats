@@ -1,14 +1,8 @@
 [
   {
-    "id": "account_1768478046434",
+    "id": "account_1768482423156",
     "name": "حساب 1",
-    "phone": "966554333129",
-    "isActive": true
-  },
-  {
-    "id": "account_1768478966928",
-    "name": "حساب 2",
     "phone": null,
-    "isActive": false
+    "isActive": true
   }
 ]

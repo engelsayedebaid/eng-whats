@@ -13,9 +13,79 @@ const port = process.env.PORT || 3000;
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
-// In-memory store for chats
-let chats = [];
+// In-memory store for chats PER ACCOUNT
+const accountChats = new Map(); // accountId -> chats[]
 let isReady = false;
+
+// Chats storage directory
+const CHATS_DIR = path.join(__dirname, ".chats_cache");
+
+// Ensure chats directory exists
+const ensureChatsDir = () => {
+  if (!fs.existsSync(CHATS_DIR)) {
+    fs.mkdirSync(CHATS_DIR, { recursive: true });
+  }
+};
+
+// Load chats from disk for an account
+const loadChatsFromDisk = (accountId) => {
+  try {
+    ensureChatsDir();
+    const filePath = path.join(CHATS_DIR, `${accountId}.json`);
+    if (fs.existsSync(filePath)) {
+      const data = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(data);
+      console.log(`Loaded ${parsed.chats?.length || 0} cached chats for account ${accountId}`);
+      return parsed.chats || [];
+    }
+  } catch (e) {
+    console.error(`Error loading cached chats for ${accountId}:`, e.message);
+  }
+  return [];
+};
+
+// Save chats to disk for an account
+const saveChats = (accountId, chats) => {
+  try {
+    ensureChatsDir();
+    const filePath = path.join(CHATS_DIR, `${accountId}.json`);
+    const data = {
+      accountId,
+      savedAt: new Date().toISOString(),
+      chats: chats
+    };
+    fs.writeFileSync(filePath, JSON.stringify(data), "utf8");
+    console.log(`Saved ${chats.length} chats to cache for account ${accountId}`);
+  } catch (e) {
+    console.error(`Error saving chats for ${accountId}:`, e.message);
+  }
+};
+
+// Helper to get current account chats (from memory or disk)
+const getCurrentChats = () => {
+  if (!currentAccountId) return [];
+  
+  // Try memory first
+  let chats = accountChats.get(currentAccountId);
+  
+  // If not in memory, try loading from disk
+  if (!chats || chats.length === 0) {
+    chats = loadChatsFromDisk(currentAccountId);
+    if (chats.length > 0) {
+      accountChats.set(currentAccountId, chats);
+    }
+  }
+  
+  return chats || [];
+};
+
+// Helper to set current account chats (both memory and disk)
+const setCurrentChats = (chats) => {
+  if (!currentAccountId) return;
+  accountChats.set(currentAccountId, chats);
+  // Save to disk for persistence
+  saveChats(currentAccountId, chats);
+};
 
 // Accounts management
 const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
@@ -227,6 +297,13 @@ app.prepare().then(() => {
         }
         io.emit("status", { isReady: true });
         io.emit("ready");
+        
+        // Send cached chats immediately if available
+        const cachedChats = getCurrentChats();
+        if (cachedChats.length > 0) {
+          console.log(`Sending ${cachedChats.length} cached chats on ready`);
+          io.emit("chats", cachedChats);
+        }
       }
     });
 
@@ -378,7 +455,7 @@ app.prepare().then(() => {
     console.log(`Initializing account: ${accountId}`);
     
     isReady = false;
-    chats = [];
+    setCurrentChats([]);
     io.emit("status", { isReady: false });
     io.emit("qrCleared");
     
@@ -551,9 +628,9 @@ app.prepare().then(() => {
           }
         }
         
-        chats = processedChats;
-        console.log(`Processed ${chats.length} chats successfully`);
-        socket.emit("chats", chats);
+        setCurrentChats(processedChats);
+        console.log(`Processed ${getCurrentChats().length} chats successfully`);
+        socket.emit("chats", getCurrentChats());
         
       } catch (error) {
         console.error("Error fetching chats:", error.message, error.stack);
@@ -653,7 +730,7 @@ app.prepare().then(() => {
         if (chatId.includes("@lid")) {
           // For LID format, try to use sendMessage directly with the client
           // First, try to find the chat in our cached chats
-          const cachedChat = chats.find(c => c.id === chatId);
+          const cachedChat = getCurrentChats().find(c => c.id === chatId);
           
           if (cachedChat && cachedChat.phone) {
             // Use the phone number to send
@@ -812,7 +889,7 @@ app.prepare().then(() => {
         console.log("Logout requested...");
         await whatsappClient.logout();
         isReady = false;
-        chats = []; // مسح المحادثات من الذاكرة
+        setCurrentChats([]); // مسح المحادثات من الذاكرة
         io.emit("status", { isReady: false });
         io.emit("logout");
         console.log("Logout successful");
@@ -820,7 +897,7 @@ app.prepare().then(() => {
         console.error("Logout error:", error);
         // حتى لو حدث خطأ، نرسل event logout لمسح البيانات في الواجهة
         isReady = false;
-        chats = [];
+        setCurrentChats([]);
         io.emit("status", { isReady: false });
         io.emit("logout");
       }
@@ -1137,8 +1214,8 @@ app.prepare().then(() => {
           }
         }
 
-        // Update global chats array
-        chats = processedChats;
+        // Update account chats
+        setCurrentChats(processedChats);
 
         // Emit completion
         const successMessage = errorCount > 0 
@@ -1158,9 +1235,9 @@ app.prepare().then(() => {
         });
 
         // Send complete chats array as final confirmation
-        socket.emit("chats", chats);
+        socket.emit("chats", getCurrentChats());
         socket.emit("syncComplete", { 
-          total: chats.length,
+          total: getCurrentChats().length,
           success: successCount,
           errors: errorCount
         });
@@ -1284,7 +1361,7 @@ app.prepare().then(() => {
         console.log("Already on this account but client not ready, initializing...");
         
         isReady = false;
-        chats = [];
+        setCurrentChats([]);
         io.emit("status", { isReady: false });
         io.emit("qrCleared");
         
@@ -1357,6 +1434,13 @@ app.prepare().then(() => {
         io.emit("status", { isReady: true });
         io.emit("ready");
         
+        // Send cached chats if available
+        const cachedChats = getCurrentChats();
+        if (cachedChats.length > 0) {
+          console.log(`Sending ${cachedChats.length} cached chats for account ${account.name}`);
+          socket.emit("chats", cachedChats);
+        }
+        
         console.log("Using existing session for account:", account.name);
         return;
       }
@@ -1367,7 +1451,7 @@ app.prepare().then(() => {
       // Reset state for new/unready account
 
       isReady = false;
-      chats = [];
+      // Don't clear chats when switching - each account has its own storage
       
       // Notify client
       socket.emit("currentAccount", currentAccountId);
@@ -1474,7 +1558,7 @@ app.prepare().then(() => {
         
         // Reset state
         isReady = false;
-        chats = [];
+        accountChats.clear(); // Clear all accounts' chats
         whatsappClient = null;
         
         // Reset accounts to default
