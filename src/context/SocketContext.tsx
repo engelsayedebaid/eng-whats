@@ -390,8 +390,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
           // أضف المحادثة الجديدة وارتبها
           const updatedChats = [...prevChats, newChat].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-          // اطلب تفاصيل المحادثة الكاملة في الخلفية
-          newSocket.emit("getChats");
+          // لا نطلب getChats هنا - لدينا المعلومات الكافية
+          // هذا يمنع الطلبات المتكررة
 
           return updatedChats;
         }

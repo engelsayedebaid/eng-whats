@@ -484,11 +484,47 @@ app.prepare().then(() => {
     socket.emit("status", { isReady });
 
 
+    // Track getChats in progress to prevent multiple calls
+    let isGettingChats = false;
+    let lastGetChatsTime = 0;
+    const GET_CHATS_THROTTLE = 10000; // 10 seconds between getChats calls
+
     // Request to fetch chats
     socket.on("getChats", async () => {
       if (!isReady) {
         socket.emit("chatsError", { message: "WhatsApp not ready" });
         return;
+      }
+
+      // Check throttle
+      const now = Date.now();
+      if (now - lastGetChatsTime < GET_CHATS_THROTTLE) {
+        console.log("getChats throttled - sending cached data");
+        const cachedChats = getCurrentChats();
+        if (cachedChats.length > 0) {
+          socket.emit("chats", cachedChats);
+        }
+        return;
+      }
+
+      // Check if already in progress
+      if (isGettingChats) {
+        console.log("getChats already in progress - sending cached data");
+        const cachedChats = getCurrentChats();
+        if (cachedChats.length > 0) {
+          socket.emit("chats", cachedChats);
+        }
+        return;
+      }
+
+      isGettingChats = true;
+      lastGetChatsTime = now;
+
+      // Send cached chats immediately while fetching new ones
+      const cachedChats = getCurrentChats();
+      if (cachedChats.length > 0) {
+        console.log(`Sending ${cachedChats.length} cached chats first`);
+        socket.emit("chats", cachedChats);
       }
 
       // Helper to delay
@@ -635,6 +671,8 @@ app.prepare().then(() => {
       } catch (error) {
         console.error("Error fetching chats:", error.message, error.stack);
         socket.emit("chatsError", { message: error.message || "Unknown error" });
+      } finally {
+        isGettingChats = false;
       }
     });
 
