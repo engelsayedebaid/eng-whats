@@ -413,39 +413,83 @@ export default function ChatWindow({ chatId }: { chatId: string | null }) {
           </div>
         ) : (
           <>
-            {chatMessages.map((msg) => (
-              <div
-                key={msg.id}
-                className={`flex ${msg.fromMe ? "justify-end" : "justify-start"}`}
-              >
-                <div
-                  className={`max-w-[70%] px-3 py-2 rounded-lg shadow ${msg.fromMe
-                    ? "bg-[#005c4b] text-white rounded-br-none"
-                    : "bg-[#202c33] text-white rounded-bl-none"
-                    }`}
-                >
-                  {/* Sender name for group messages */}
-                  {!msg.fromMe && chat?.isGroup && msg.senderName && (
-                    <p className="text-xs text-green-400 font-medium mb-1 ltr-num">
-                      {msg.senderName}
-                    </p>
-                  )}
+            {(() => {
+              // Helper function to get date label
+              const getDateLabel = (timestamp: number): string => {
+                const msgDate = new Date(timestamp * 1000);
+                const today = new Date();
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
 
-                  {/* Message content */}
-                  {renderMessageContent(msg)}
+                const msgDateStr = msgDate.toDateString();
+                const todayStr = today.toDateString();
+                const yesterdayStr = yesterday.toDateString();
 
-                  {/* Time and status */}
-                  <div className="flex items-center justify-end gap-1 mt-1">
-                    <span className="text-[10px] text-gray-300 ltr-num">
-                      {formatTime(msg.timestamp)}
-                    </span>
-                    {msg.fromMe && (
-                      <CheckCheck className="w-4 h-4 text-blue-400" />
+                if (msgDateStr === todayStr) {
+                  return "اليوم";
+                } else if (msgDateStr === yesterdayStr) {
+                  return "أمس";
+                } else {
+                  return msgDate.toLocaleDateString("ar-EG", {
+                    weekday: "long",
+                    day: "numeric",
+                    month: "long",
+                    year: msgDate.getFullYear() !== today.getFullYear() ? "numeric" : undefined
+                  });
+                }
+              };
+
+              let lastDateLabel = "";
+
+              return chatMessages.map((msg, index) => {
+                const currentDateLabel = getDateLabel(msg.timestamp);
+                const showDateSeparator = currentDateLabel !== lastDateLabel;
+                lastDateLabel = currentDateLabel;
+
+                return (
+                  <div key={msg.id}>
+                    {/* Date Separator */}
+                    {showDateSeparator && (
+                      <div className="flex items-center justify-center my-4">
+                        <div className="bg-[#1d2b33] text-gray-300 text-xs px-3 py-1.5 rounded-lg shadow-md">
+                          {currentDateLabel}
+                        </div>
+                      </div>
                     )}
+
+                    {/* Message */}
+                    <div className={`flex ${msg.fromMe ? "justify-end" : "justify-start"}`}>
+                      <div
+                        className={`max-w-[70%] px-3 py-2 rounded-lg shadow ${msg.fromMe
+                          ? "bg-[#005c4b] text-white rounded-br-none"
+                          : "bg-[#202c33] text-white rounded-bl-none"
+                          }`}
+                      >
+                        {/* Sender name for group messages */}
+                        {!msg.fromMe && chat?.isGroup && msg.senderName && (
+                          <p className="text-xs text-green-400 font-medium mb-1 ltr-num">
+                            {msg.senderName}
+                          </p>
+                        )}
+
+                        {/* Message content */}
+                        {renderMessageContent(msg)}
+
+                        {/* Time and status */}
+                        <div className="flex items-center justify-end gap-1 mt-1">
+                          <span className="text-[10px] text-gray-300 ltr-num">
+                            {formatTime(msg.timestamp)}
+                          </span>
+                          {msg.fromMe && (
+                            <CheckCheck className="w-4 h-4 text-blue-400" />
+                          )}
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
-            ))}
+                );
+              });
+            })()}
             <div ref={messagesEndRef} />
           </>
         )}
@@ -479,8 +523,8 @@ export default function ChatWindow({ chatId }: { chatId: string | null }) {
             type="submit"
             disabled={!messageInput.trim() || isSending}
             className={`p-3 rounded-xl transition-all duration-300 transform ${messageInput.trim() && !isSending
-                ? 'bg-gradient-to-r from-green-500 to-emerald-500 text-white hover:from-green-600 hover:to-emerald-600 shadow-lg shadow-green-500/30 hover:scale-105 active:scale-95'
-                : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+              ? 'bg-gradient-to-r from-green-500 to-emerald-500 text-white hover:from-green-600 hover:to-emerald-600 shadow-lg shadow-green-500/30 hover:scale-105 active:scale-95'
+              : 'bg-gray-700 text-gray-500 cursor-not-allowed'
               }`}
           >
             {isSending ? (

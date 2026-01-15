@@ -45,11 +45,14 @@ interface Message {
 }
 
 interface SyncProgress {
-  status: "idle" | "started" | "processing" | "completed" | "error";
+  status: "idle" | "started" | "fetching" | "processing" | "completed" | "error" | "cancelled" | "quick" | "info";
   message: string;
   progress: number;
   total: number;
   current: number;
+  chatName?: string;
+  successCount?: number;
+  errorCount?: number;
 }
 
 interface SearchResult {
@@ -248,12 +251,12 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Sync progress handler
     newSocket.on("syncProgress", (data: SyncProgress) => {
-      console.log("Sync progress received:", data);
+      console.log("Sync progress:", data.status, data.progress + "%", data.chatName || "");
       setSyncProgress(data);
 
-      if (data.status === "started" || data.status === "processing") {
+      if (data.status === "started" || data.status === "fetching" || data.status === "processing") {
         setIsLoading(true);
-      } else if (data.status === "completed") {
+      } else if (data.status === "completed" || data.status === "quick") {
         // عند اكتمال المزامنة، نوقف التحميل بعد ثانية
         setTimeout(() => {
           setIsLoading(false);
@@ -262,12 +265,63 @@ export function SocketProvider({ children }: { children: ReactNode }) {
             setSyncProgress(defaultSyncProgress);
           }, 5000);
         }, 1000);
-      } else if (data.status === "error") {
+      } else if (data.status === "error" || data.status === "cancelled") {
         setIsLoading(false);
         setTimeout(() => {
           setSyncProgress(defaultSyncProgress);
         }, 5000);
       }
+    });
+
+    // Streaming sync - receive individual chats in real-time
+    newSocket.on("syncChat", (data: { chat: Chat; index: number; total: number }) => {
+      // Add or update the chat immediately as it arrives
+      setChats(prev => {
+        const existingIndex = prev.findIndex(c => c.id === data.chat.id);
+        if (existingIndex >= 0) {
+          // Update existing chat
+          const updated = [...prev];
+          updated[existingIndex] = data.chat;
+          return updated;
+        } else {
+          // Add new chat and keep sorted by timestamp
+          return [...prev, data.chat].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        }
+      });
+    });
+
+    // Clear chats before fresh sync
+    newSocket.on("syncClear", () => {
+      console.log("Clearing chats for fresh sync");
+      setChats([]);
+    });
+
+    // Sync complete with stats
+    newSocket.on("syncComplete", (data: { total: number; success: number; errors: number }) => {
+      console.log(`Sync complete: ${data.success} success, ${data.errors} errors out of ${data.total}`);
+    });
+
+    // Quick sync data - update timestamps and unread counts
+    newSocket.on("quickSyncData", (updates: Array<{ id: string; unreadCount: number; timestamp: number; lastMessageBody: string | null; lastMessageFromMe: boolean }>) => {
+      setChats(prev => {
+        const updated = [...prev];
+        for (const update of updates) {
+          const index = updated.findIndex(c => c.id === update.id);
+          if (index >= 0) {
+            updated[index] = {
+              ...updated[index],
+              unreadCount: update.unreadCount,
+              timestamp: update.timestamp,
+              lastMessage: updated[index].lastMessage ? {
+                ...updated[index].lastMessage!,
+                body: update.lastMessageBody || updated[index].lastMessage!.body,
+                fromMe: update.lastMessageFromMe,
+              } : null,
+            };
+          }
+        }
+        return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      });
     });
 
     // Search progress handler
@@ -302,7 +356,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setMessages((prev) => ({ ...prev, [data.chatId]: data.messages }));
     });
 
-    newSocket.on("newMessage", (message: Message & { from: string; chatId: string; senderName: string; type: string; typeLabel: string }) => {
+    newSocket.on("newMessage", (message: Message & { from: string; chatId: string; senderName: string; type: string; typeLabel: string; chatName?: string; isGroup?: boolean }) => {
       console.log("New message received:", message.body?.substring(0, 30));
 
       setMessages((prev) => {
@@ -318,8 +372,36 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         const chatIndex = prevChats.findIndex(c => c.id === chatId);
 
         if (chatIndex === -1) {
+          // إذا لم تكن المحادثة موجودة، نضيفها كمحادثة جديدة
+          // هذا مهم خاصة أثناء المزامنة
+          const phoneNumber = chatId.replace("@c.us", "").replace("@g.us", "");
+          const newChat: Chat = {
+            id: chatId,
+            name: message.chatName || message.senderName || phoneNumber,
+            phone: phoneNumber,
+            profilePic: null,
+            isGroup: message.isGroup || chatId.includes("@g.us"),
+            participants: [],
+            participantCount: 0,
+            unreadCount: message.fromMe ? 0 : 1,
+            lastMessage: {
+              body: message.body,
+              fromMe: message.fromMe,
+              timestamp: message.timestamp,
+              type: message.type || "chat",
+              typeLabel: message.typeLabel || "نص",
+              senderName: message.senderName || "",
+            },
+            timestamp: message.timestamp,
+          };
+
+          // أضف المحادثة الجديدة وارتبها
+          const updatedChats = [...prevChats, newChat].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+          // اطلب تفاصيل المحادثة الكاملة في الخلفية
           newSocket.emit("getChats");
-          return prevChats;
+
+          return updatedChats;
         }
 
         const updatedChats = [...prevChats];

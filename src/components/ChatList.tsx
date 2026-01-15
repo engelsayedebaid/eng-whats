@@ -6,13 +6,14 @@ import {
   Search, Filter, MessageCircle, CheckCheck, Clock, RefreshCw, Loader2, Users,
   Calendar, CalendarDays, CalendarRange, Image as ImageIcon, Video, Mic, FileText,
   MapPin, User, Sticker, BarChart2, ChevronDown, X, Archive, ArchiveRestore, Pin, PinOff,
-  Eye, EyeOff
+  Eye, EyeOff, UserPlus, Sparkles
 } from "lucide-react";
 import Image from "next/image";
 
 type FilterType = "all" | "replied" | "not_replied";
 type DateFilterType = "all" | "today" | "week" | "month";
 type TypeFilterType = "all" | "text" | "media" | "voice" | "document";
+type ChatTypeFilter = "all" | "private" | "groups";
 
 // LTR Text Component for proper number display
 function LTRText({ children, className = "" }: { children: React.ReactNode; className?: string }) {
@@ -159,16 +160,19 @@ export default function ChatList({
   onSelectChat: (chatId: string) => void;
   selectedChatId: string | null;
 }) {
-  const { chats, isLoading, syncAllChats, fetchChats, isReady, syncProgress, searchMessages, clearSearch, searchState, privacyMode, setPrivacyMode } = useSocket();
+  const { chats, messages, isLoading, syncAllChats, fetchChats, isReady, syncProgress, searchMessages, clearSearch, searchState, privacyMode, setPrivacyMode } = useSocket();
   const [filter, setFilter] = useState<FilterType>("all");
   const [dateFilter, setDateFilter] = useState<DateFilterType>("all");
   const [typeFilter, setTypeFilter] = useState<TypeFilterType>("all");
+  const [chatTypeFilter, setChatTypeFilter] = useState<ChatTypeFilter>("all");
+  const [showNewContactsOnly, setShowNewContactsOnly] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showFilters, setShowFilters] = useState(false);
   const [openSections, setOpenSections] = useState({
     date: true,
     status: true,
-    type: false
+    type: false,
+    chatType: true
   });
   const [archivedChats, setArchivedChats] = useState<string[]>([]);
   const [showArchived, setShowArchived] = useState(false);
@@ -260,6 +264,11 @@ export default function ChatList({
   const filteredChats = useMemo(() => {
     const minTimestamp = getDateRange(dateFilter);
 
+    // Get today's start timestamp for new contacts filter
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStartTimestamp = today.getTime() / 1000;
+
     return chats
       .filter((chat) => {
         // Archive filter
@@ -276,6 +285,25 @@ export default function ChatList({
           if (!matchesName && !matchesPhone && !matchesMessage) return false;
         }
 
+        // New contacts today filter - only show chats where ALL messages are from today
+        if (showNewContactsOnly) {
+          if (chat.isGroup) return false; // Exclude groups
+
+          // Check if this chat has messages loaded
+          const chatMessages = messages[chat.id];
+          if (chatMessages && chatMessages.length > 0) {
+            // Check if the oldest message is from today
+            const oldestMessage = chatMessages.reduce((oldest, msg) =>
+              msg.timestamp < oldest.timestamp ? msg : oldest
+              , chatMessages[0]);
+            if (oldestMessage.timestamp < todayStartTimestamp) return false;
+          } else {
+            // If no messages loaded, check the chat timestamp
+            const chatTimestamp = chat.timestamp || 0;
+            if (chatTimestamp < todayStartTimestamp) return false;
+          }
+        }
+
         // Date filter
         const chatTimestamp = chat.lastMessage?.timestamp || chat.timestamp || 0;
         if (dateFilter !== "all" && chatTimestamp < minTimestamp) {
@@ -284,6 +312,10 @@ export default function ChatList({
 
         // Type filter
         if (!matchesTypeFilter(chat)) return false;
+
+        // Chat type filter (private vs groups)
+        if (chatTypeFilter === "private" && chat.isGroup) return false;
+        if (chatTypeFilter === "groups" && !chat.isGroup) return false;
 
         // Status filter
         if (filter === "replied") {
@@ -303,7 +335,7 @@ export default function ChatList({
         // Then sort by timestamp
         return (b.timestamp || 0) - (a.timestamp || 0);
       });
-  }, [chats, searchQuery, dateFilter, typeFilter, filter, archivedChats, showArchived, pinnedChats]);
+  }, [chats, searchQuery, dateFilter, typeFilter, filter, chatTypeFilter, showNewContactsOnly, archivedChats, showArchived, pinnedChats]);
 
   const formatTime = (timestamp: number) => {
     if (!timestamp) return "";
@@ -318,9 +350,35 @@ export default function ChatList({
   };
 
   const getFilterStats = () => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayTimestamp = today.getTime() / 1000;
+
     const replied = chats.filter((c) => c.lastMessage?.fromMe === true).length;
     const notReplied = chats.filter((c) => c.lastMessage?.fromMe === false).length;
-    return { all: chats.length, replied, notReplied };
+    const privateChats = chats.filter((c) => !c.isGroup).length;
+    const groupChats = chats.filter((c) => c.isGroup).length;
+
+    // New contacts today: private chats where ALL messages are from today (no previous history)
+    const newContactsToday = chats.filter((c) => {
+      if (c.isGroup) return false; // Exclude groups
+
+      // Check if this chat has messages loaded
+      const chatMessages = messages[c.id];
+      if (chatMessages && chatMessages.length > 0) {
+        // Check if the oldest message is from today
+        const oldestMessage = chatMessages.reduce((oldest, msg) =>
+          msg.timestamp < oldest.timestamp ? msg : oldest
+          , chatMessages[0]);
+        return oldestMessage.timestamp >= todayTimestamp;
+      }
+
+      // If no messages loaded, check the chat timestamp
+      const chatTimestamp = c.timestamp || 0;
+      return chatTimestamp >= todayTimestamp;
+    }).length;
+
+    return { all: chats.length, replied, notReplied, privateChats, groupChats, newContactsToday };
   };
 
   const getMessageTypeIcon = (type: string) => {
@@ -344,7 +402,9 @@ export default function ChatList({
   const activeFilterCount = [
     dateFilter !== "all",
     filter !== "all",
-    typeFilter !== "all"
+    typeFilter !== "all",
+    chatTypeFilter !== "all",
+    showNewContactsOnly
   ].filter(Boolean).length;
 
   // Reset all filters
@@ -352,6 +412,8 @@ export default function ChatList({
     setDateFilter("all");
     setFilter("all");
     setTypeFilter("all");
+    setChatTypeFilter("all");
+    setShowNewContactsOnly(false);
     setSearchQuery("");
   };
 
@@ -603,6 +665,40 @@ export default function ChatList({
                 color="purple"
               />
             </FilterSection>
+
+            {/* Chat Type Filters (Private vs Groups) */}
+            <FilterSection
+              title="نوع المحادثة"
+              icon={<Users className="w-4 h-4" />}
+              isOpen={openSections.chatType}
+              onToggle={() => toggleSection("chatType")}
+              activeCount={chatTypeFilter !== "all" ? 1 : 0}
+            >
+              <FilterButton
+                active={chatTypeFilter === "all"}
+                onClick={() => setChatTypeFilter("all")}
+                icon={<MessageCircle className="w-3.5 h-3.5" />}
+                label="الكل"
+                count={stats.all}
+                color="blue"
+              />
+              <FilterButton
+                active={chatTypeFilter === "private"}
+                onClick={() => setChatTypeFilter("private")}
+                icon={<User className="w-3.5 h-3.5" />}
+                label="محادثات خاصة"
+                count={stats.privateChats}
+                color="blue"
+              />
+              <FilterButton
+                active={chatTypeFilter === "groups"}
+                onClick={() => setChatTypeFilter("groups")}
+                icon={<Users className="w-3.5 h-3.5" />}
+                label="مجموعات"
+                count={stats.groupChats}
+                color="blue"
+              />
+            </FilterSection>
           </div>
         )}
 
@@ -610,24 +706,40 @@ export default function ChatList({
         {!showFilters && (
           <div className="flex gap-2 flex-wrap">
             <FilterButton
-              active={filter === "all"}
-              onClick={() => setFilter("all")}
+              active={filter === "all" && chatTypeFilter === "all" && !showNewContactsOnly}
+              onClick={() => { setFilter("all"); setChatTypeFilter("all"); setShowNewContactsOnly(false); }}
               icon={<MessageCircle className="w-3.5 h-3.5" />}
               label="الكل"
               count={stats.all}
               color="green"
             />
             <FilterButton
-              active={filter === "replied"}
-              onClick={() => setFilter("replied")}
-              icon={<CheckCheck className="w-3.5 h-3.5" />}
-              label="تم الرد"
-              count={stats.replied}
-              color="green"
+              active={showNewContactsOnly}
+              onClick={() => setShowNewContactsOnly(!showNewContactsOnly)}
+              icon={<Sparkles className="w-3.5 h-3.5" />}
+              label="جديد اليوم"
+              count={stats.newContactsToday}
+              color="purple"
+            />
+            <FilterButton
+              active={chatTypeFilter === "private" && !showNewContactsOnly}
+              onClick={() => { setChatTypeFilter(chatTypeFilter === "private" ? "all" : "private"); setShowNewContactsOnly(false); }}
+              icon={<User className="w-3.5 h-3.5" />}
+              label="خاصة"
+              count={stats.privateChats}
+              color="blue"
+            />
+            <FilterButton
+              active={chatTypeFilter === "groups"}
+              onClick={() => { setChatTypeFilter(chatTypeFilter === "groups" ? "all" : "groups"); setShowNewContactsOnly(false); }}
+              icon={<Users className="w-3.5 h-3.5" />}
+              label="مجموعات"
+              count={stats.groupChats}
+              color="blue"
             />
             <FilterButton
               active={filter === "not_replied"}
-              onClick={() => setFilter("not_replied")}
+              onClick={() => setFilter(filter === "not_replied" ? "all" : "not_replied")}
               icon={<Clock className="w-3.5 h-3.5" />}
               label="بانتظار الرد"
               count={stats.notReplied}
@@ -651,14 +763,23 @@ export default function ChatList({
       </div>
 
       {/* Sync Progress Bar */}
-      {(syncProgress.status === "started" || syncProgress.status === "processing") && (
+      {(syncProgress.status === "started" || syncProgress.status === "fetching" || syncProgress.status === "processing") && (
         <div className="p-4 bg-gradient-to-r from-[#1a2730] to-[#111b21] border-b border-gray-700/30">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin text-green-400" />
-              <span className="text-sm text-white font-medium">جاري المزامنة...</span>
+              <span className="text-sm text-white font-medium">
+                {syncProgress.status === "fetching" ? "جاري جلب المحادثات..." : "جاري المزامنة..."}
+              </span>
             </div>
-            <span className="text-sm text-green-400 font-bold ltr-num">{syncProgress.progress}%</span>
+            <div className="flex items-center gap-3">
+              {chats.length > 0 && (
+                <span className="text-xs text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded-full ltr-num">
+                  {chats.length} محادثة
+                </span>
+              )}
+              <span className="text-sm text-green-400 font-bold ltr-num">{syncProgress.progress}%</span>
+            </div>
           </div>
           <div className="relative h-2 bg-gray-700 rounded-full overflow-hidden">
             <div
@@ -668,7 +789,7 @@ export default function ChatList({
             <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent animate-shimmer" />
           </div>
           <div className="flex items-center justify-between mt-2 text-xs text-gray-400">
-            <span>{syncProgress.message}</span>
+            <span className="truncate max-w-[60%]">{syncProgress.message}</span>
             {syncProgress.total > 0 && (
               <span className="ltr-num">{syncProgress.current}/{syncProgress.total}</span>
             )}
@@ -679,8 +800,25 @@ export default function ChatList({
       {/* Sync Completed Message */}
       {syncProgress.status === "completed" && (
         <div className="p-3 bg-green-500/10 border-b border-green-500/20">
-          <div className="flex items-center gap-2 text-green-400">
-            <CheckCheck className="w-4 h-4" />
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-green-400">
+              <CheckCheck className="w-4 h-4" />
+              <span className="text-sm">{syncProgress.message}</span>
+            </div>
+            {syncProgress.errorCount !== undefined && syncProgress.errorCount > 0 && (
+              <span className="text-xs text-orange-400 bg-orange-500/10 px-2 py-0.5 rounded-full">
+                {syncProgress.errorCount} خطأ
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Sync Cancelled Message */}
+      {syncProgress.status === "cancelled" && (
+        <div className="p-3 bg-orange-500/10 border-b border-orange-500/20">
+          <div className="flex items-center gap-2 text-orange-400">
+            <Clock className="w-4 h-4" />
             <span className="text-sm">{syncProgress.message}</span>
           </div>
         </div>
