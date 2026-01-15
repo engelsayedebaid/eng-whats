@@ -213,8 +213,6 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setIsReady(data.isReady);
       if (data.isReady) {
         setQrCode(null);
-        // Don't start auto-sync - cached chats will be sent by server
-        // User can manually sync if needed
       }
     });
 
@@ -226,14 +224,17 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     newSocket.on("ready", () => {
       setIsReady(true);
       setQrCode(null);
-      // Don't start auto-sync - wait for cached chats from server
-      // If no cached chats, user can manually sync
+      setIsLoading(true);
+      // بدء المزامنة التلقائية بعد الاتصال
+      setTimeout(() => {
+        console.log("Starting automatic sync after ready...");
+        newSocket.emit("syncAllChats", { maxChats: 1000 });
+      }, 2000);
     });
 
     newSocket.on("chats", (data: Chat[]) => {
       setChats(data);
-      setIsLoading(false);
-      // Stop loading when chats are received (either cached or synced)
+      // لا نوقف التحميل هنا - سيتم التحكم به من syncProgress
     });
 
     newSocket.on("chatsError", () => {
