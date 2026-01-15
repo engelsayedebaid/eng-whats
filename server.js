@@ -574,7 +574,7 @@ app.prepare().then(() => {
         
         const processedChats = [];
         
-        for (const chat of allChats.slice(0, 100)) {
+        for (const chat of allChats) {
           try {
             // Get profile picture
             let profilePic = null;
