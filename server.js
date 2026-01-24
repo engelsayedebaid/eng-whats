@@ -952,7 +952,6 @@ app.prepare().then(() => {
       try {
         console.log(`Sending message to ${chatId}: ${message.substring(0, 50)}...`);
         
-        let sentMessage;
         let targetId = chatId;
         
         // Check if it's a LID format (Linked ID) - new WhatsApp format
@@ -968,32 +967,72 @@ app.prepare().then(() => {
           }
         }
         
-        // Use client.sendMessage directly - more reliable
+        // Try multiple methods to send the message
+        let sentMessage = null;
+        let lastError = null;
+        
+        // Method 1: Direct sendMessage (simplest)
         try {
           sentMessage = await whatsappClient.sendMessage(targetId, message);
-        } catch (directError) {
-          console.log("Direct send failed, trying via chat object...", directError.message);
-          // Fallback: try getting chat by ID
+          if (sentMessage) {
+            console.log("Message sent via direct method");
+          }
+        } catch (e) {
+          console.log("Method 1 failed:", e.message);
+          lastError = e;
+        }
+        
+        // Method 2: Get chat first, then send
+        if (!sentMessage) {
           try {
-            const chat = await whatsappClient.getChatById(chatId);
-            if (chat) {
+            const chat = await whatsappClient.getChatById(targetId);
+            if (chat && typeof chat.sendMessage === 'function') {
               sentMessage = await chat.sendMessage(message);
+              if (sentMessage) {
+                console.log("Message sent via chat.sendMessage");
+              }
             }
-          } catch (chatError) {
-            console.error("Chat send also failed:", chatError.message);
-            throw directError; // Throw the original error
+          } catch (e) {
+            console.log("Method 2 failed:", e.message);
+            lastError = e;
           }
         }
         
-        console.log("Message sent successfully!");
+        // Method 3: Use pupPage directly (last resort)
+        if (!sentMessage && whatsappClient.pupPage) {
+          try {
+            console.log("Trying pupPage method...");
+            const result = await whatsappClient.pupPage.evaluate(async (to, msg) => {
+              const chatWid = window.Store.WidFactory.createWid(to);
+              const chat = await window.Store.Chat.find(chatWid);
+              if (chat) {
+                await chat.sendMessage(msg);
+                return { success: true };
+              }
+              return { success: false };
+            }, targetId, message);
+            
+            if (result && result.success) {
+              console.log("Message sent via pupPage");
+              sentMessage = { id: { _serialized: `manual_${Date.now()}` }, timestamp: Date.now() / 1000 };
+            }
+          } catch (e) {
+            console.log("Method 3 failed:", e.message);
+            lastError = e;
+          }
+        }
         
-        // Handle response safely
-        socket.emit("messageSent", { 
-          success: true, 
-          chatId,
-          messageId: sentMessage?.id?._serialized || sentMessage?.id || "unknown",
-          timestamp: sentMessage?.timestamp || Date.now() / 1000
-        });
+        if (sentMessage) {
+          console.log("Message sent successfully!");
+          socket.emit("messageSent", { 
+            success: true, 
+            chatId,
+            messageId: sentMessage?.id?._serialized || sentMessage?.id || `msg_${Date.now()}`,
+            timestamp: sentMessage?.timestamp || Date.now() / 1000
+          });
+        } else {
+          throw lastError || new Error("All send methods failed");
+        }
 
       } catch (error) {
         console.error("Send message error:", error);
