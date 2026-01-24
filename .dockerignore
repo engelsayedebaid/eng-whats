@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+.gitignore
+*.md
+.env
+.env.local
+.env*.local
+.wwebjs_auth
+.wwebjs_cache
+.chats_cache
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
