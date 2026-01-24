@@ -6,6 +6,20 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const fs = require("fs");
 const path = require("path");
 
+// Load environment variables from .env.local
+require('dotenv').config({ path: path.join(__dirname, '.env.local') });
+
+// Convex Integration
+const { 
+  accountsDb, 
+  sessionsDb, 
+  chatsDb, 
+  syncStatusDb, 
+  eventsDb, 
+  migration,
+  isConvexReady 
+} = require("./convex-integration");
+
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
 const port = process.env.PORT || 3000;
@@ -61,30 +75,69 @@ const saveChats = (accountId, chats) => {
   }
 };
 
-// Helper to get current account chats (from memory or disk)
-const getCurrentChats = () => {
+// Helper to get current account chats (from memory, Convex, or disk)
+const getCurrentChats = async () => {
   if (!currentAccountId) return [];
   
   // Try memory first
   let chats = accountChats.get(currentAccountId);
   
-  // If not in memory, try loading from disk
+  // If not in memory, try Convex
+  if ((!chats || chats.length === 0) && isConvexReady()) {
+    try {
+      chats = await chatsDb.getByAccountId(currentAccountId);
+      if (chats && chats.length > 0) {
+        accountChats.set(currentAccountId, chats);
+        console.log(`Loaded ${chats.length} chats from Convex for account ${currentAccountId}`);
+        return chats;
+      }
+    } catch (e) {
+      console.error("Error loading chats from Convex:", e.message);
+    }
+  }
+  
+  // Fallback to disk
   if (!chats || chats.length === 0) {
     chats = loadChatsFromDisk(currentAccountId);
     if (chats.length > 0) {
       accountChats.set(currentAccountId, chats);
+      // Migrate to Convex if available
+      if (isConvexReady()) {
+        chatsDb.batchUpsert(currentAccountId, chats).catch(e => 
+          console.error("Error migrating chats to Convex:", e.message)
+        );
+      }
     }
   }
   
   return chats || [];
 };
 
-// Helper to set current account chats (both memory and disk)
+// Sync version for places that can't use async
+const getCurrentChatsSync = () => {
+  if (!currentAccountId) return [];
+  let chats = accountChats.get(currentAccountId);
+  if (!chats || chats.length === 0) {
+    chats = loadChatsFromDisk(currentAccountId);
+    if (chats.length > 0) {
+      accountChats.set(currentAccountId, chats);
+    }
+  }
+  return chats || [];
+};
+
+// Helper to set current account chats (memory, disk, and Convex)
 const setCurrentChats = (chats) => {
   if (!currentAccountId) return;
   accountChats.set(currentAccountId, chats);
   // Save to disk for persistence
   saveChats(currentAccountId, chats);
+  // Save to Convex for cloud sync
+  if (isConvexReady()) {
+    chatsDb.batchUpsert(currentAccountId, chats).catch(e => 
+      console.error("Error saving chats to Convex:", e.message)
+    );
+  }
 };
 
 // Accounts management
@@ -130,6 +183,14 @@ const saveAccounts = (accounts) => {
 let accounts = loadAccounts();
 // Set current account to the active one or first
 currentAccountId = accounts.find(a => a.isActive)?.id || accounts[0]?.id;
+
+// Migrate accounts to Convex on startup (async, non-blocking)
+(async () => {
+  if (isConvexReady() && accounts.length > 0) {
+    console.log("Migrating accounts to Convex...");
+    await migration.migrateAccounts(accounts);
+  }
+})().catch(e => console.error("Migration error:", e.message));
 
 // Find Chromium executable path
 const getChromiumPath = () => {
@@ -271,9 +332,13 @@ app.prepare().then(() => {
       if (currentAccountId === accountId) {
         io.emit("qr", qr);
       }
+      // Log QR event to Convex
+      if (isConvexReady()) {
+        eventsDb.log(accountId, "qr_generated", "QR code generated for scanning").catch(() => {});
+      }
     });
 
-    client.on("ready", () => {
+    client.on("ready", async () => {
       console.log(`WhatsApp client is ready for account: ${accountId}!`);
       // Mark this client as ready
       clientReadyStates.set(accountId, true);
@@ -290,6 +355,11 @@ app.prepare().then(() => {
               accounts[accountIndex].phone = phoneNumber;
               saveAccounts(accounts);
               io.emit("accounts", accounts);
+              
+              // Sync account to Convex
+              if (isConvexReady()) {
+                accountsDb.update(accountId, { phone: phoneNumber }).catch(() => {});
+              }
             }
           }
         } catch (e) {
@@ -298,8 +368,15 @@ app.prepare().then(() => {
         io.emit("status", { isReady: true });
         io.emit("ready");
         
+        // Update session state in Convex
+        if (isConvexReady()) {
+          sessionsDb.setReady(accountId, true).catch(() => {});
+          sessionsDb.setAuthenticated(accountId, true).catch(() => {});
+          eventsDb.log(accountId, "ready", "WhatsApp client is ready").catch(() => {});
+        }
+        
         // Send cached chats immediately if available
-        const cachedChats = getCurrentChats();
+        const cachedChats = await getCurrentChats();
         if (cachedChats.length > 0) {
           console.log(`Sending ${cachedChats.length} cached chats on ready`);
           io.emit("chats", cachedChats);
@@ -310,12 +387,22 @@ app.prepare().then(() => {
 
     client.on("authenticated", () => {
       console.log(`WhatsApp client authenticated for account: ${accountId}`);
+      // Sync authentication state to Convex
+      if (isConvexReady()) {
+        sessionsDb.setAuthenticated(accountId, true).catch(() => {});
+        eventsDb.log(accountId, "authenticated", "WhatsApp client authenticated").catch(() => {});
+      }
     });
 
     client.on("auth_failure", (msg) => {
       console.error(`Auth failure for account ${accountId}:`, msg);
       if (currentAccountId === accountId) {
         io.emit("authFailure", { message: msg });
+      }
+      // Log auth failure to Convex
+      if (isConvexReady()) {
+        sessionsDb.setAuthenticated(accountId, false).catch(() => {});
+        eventsDb.log(accountId, "auth_failure", msg).catch(() => {});
       }
     });
 
@@ -329,8 +416,13 @@ app.prepare().then(() => {
         io.emit("status", { isReady: false });
         io.emit("disconnected", { reason });
       }
+      
+      // Update session state in Convex
+      if (isConvexReady()) {
+        sessionsDb.setDisconnected(accountId, reason).catch(() => {});
+        eventsDb.log(accountId, "disconnected", reason).catch(() => {});
+      }
     });
-
 
     client.on("message", async (message) => {
       if (currentAccountId !== accountId) return;
@@ -351,6 +443,29 @@ app.prepare().then(() => {
           const chat = await message.getChat();
           chatName = chat.name || senderName;
           isGroup = chat.isGroup || false;
+          
+          // Update chat in memory and Convex with new message
+          const chatId = message.from;
+          const existingChats = accountChats.get(currentAccountId) || [];
+          const chatIndex = existingChats.findIndex(c => c.id === chatId);
+          
+          if (chatIndex !== -1) {
+            // Update existing chat with new message info
+            existingChats[chatIndex].lastMessage = {
+              body: message.body || "رسالة جديدة",
+              fromMe: message.fromMe,
+              timestamp: message.timestamp,
+              type: message.type,
+              senderName: senderName,
+            };
+            existingChats[chatIndex].timestamp = message.timestamp;
+            existingChats[chatIndex].unreadCount = (existingChats[chatIndex].unreadCount || 0) + (message.fromMe ? 0 : 1);
+            
+            // Update Convex in background
+            if (isConvexReady()) {
+              chatsDb.upsertChat(currentAccountId, existingChats[chatIndex]).catch(() => {});
+            }
+          }
         } catch (e) {
           // Use sender name as chat name if chat fetch fails
           chatName = senderName;
@@ -451,28 +566,103 @@ app.prepare().then(() => {
   };
 
   // Initialize or switch to account
-  const initializeAccount = async (accountId) => {
-    console.log(`Initializing account: ${accountId}`);
+  const initializeAccount = async (accountId, retryCount = 0) => {
+    console.log(`Initializing account: ${accountId}${retryCount > 0 ? ` (retry ${retryCount})` : ''}`);
     
     isReady = false;
-    setCurrentChats([]);
     io.emit("status", { isReady: false });
     io.emit("qrCleared");
     
-    let client = whatsappClients.get(accountId);
-    
-    if (!client) {
-      client = createWhatsAppClient(accountId);
-      whatsappClients.set(accountId, client);
-      setupClientEvents(client, accountId);
+    // Check Convex for session state first
+    if (isConvexReady()) {
+      try {
+        const session = await sessionsDb.getByAccountId(accountId);
+        if (session && session.isReady) {
+          console.log(`Session found in Convex for ${accountId}, checking client state...`);
+        }
+        
+        // Load cached chats from Convex
+        const cachedChats = await chatsDb.getByAccountId(accountId);
+        if (cachedChats && cachedChats.length > 0) {
+          console.log(`Loaded ${cachedChats.length} cached chats from Convex`);
+          accountChats.set(accountId, cachedChats);
+          io.emit("chats", cachedChats);
+        }
+      } catch (e) {
+        console.error("Error checking Convex session:", e.message);
+      }
     }
     
+    let client = whatsappClients.get(accountId);
+    
+    // Check if client already exists and is ready
+    if (client && clientReadyStates.get(accountId)) {
+      console.log(`Client already ready for ${accountId}, reusing...`);
+      isReady = true;
+      io.emit("status", { isReady: true });
+      io.emit("ready");
+      whatsappClient = client;
+      
+      // Send cached chats
+      const chats = await getCurrentChats();
+      if (chats.length > 0) {
+        io.emit("chats", chats);
+      }
+      return;
+    }
+    
+    // If there's an existing client that's not ready, destroy it first
+    if (client) {
+      try {
+        console.log(`Destroying existing non-ready client for ${accountId}...`);
+        await client.destroy();
+      } catch (e) {
+        console.log("Error destroying client (may already be closed):", e.message);
+      }
+      whatsappClients.delete(accountId);
+      clientReadyStates.delete(accountId);
+    }
+    
+    // Create new client
+    client = createWhatsAppClient(accountId);
+    whatsappClients.set(accountId, client);
+    setupClientEvents(client, accountId);
     whatsappClient = client;
+    
+    // Log initialization event to Convex
+    if (isConvexReady()) {
+      eventsDb.log(accountId, "initializing", "Starting WhatsApp client initialization").catch(() => {});
+    }
     
     try {
       await client.initialize();
     } catch (error) {
       console.error(`Failed to initialize account ${accountId}:`, error.message);
+      
+      // If it's a Protocol error and we haven't retried yet, try again with fresh client
+      if (retryCount < 1 && (error.message.includes("Protocol error") || error.message.includes("Session closed"))) {
+        console.log("Puppeteer session error detected, retrying with fresh client...");
+        
+        // Clean up the failed client
+        try {
+          await client.destroy();
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+        whatsappClients.delete(accountId);
+        clientReadyStates.delete(accountId);
+        
+        // Wait a bit before retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Retry
+        return initializeAccount(accountId, retryCount + 1);
+      }
+      
+      // Log error to Convex
+      if (isConvexReady()) {
+        eventsDb.log(accountId, "error", `Initialization failed: ${error.message}`).catch(() => {});
+      }
     }
   };
 
@@ -763,47 +953,51 @@ app.prepare().then(() => {
         console.log(`Sending message to ${chatId}: ${message.substring(0, 50)}...`);
         
         let sentMessage;
+        let targetId = chatId;
         
         // Check if it's a LID format (Linked ID) - new WhatsApp format
         if (chatId.includes("@lid")) {
-          // For LID format, try to use sendMessage directly with the client
-          // First, try to find the chat in our cached chats
-          const cachedChat = getCurrentChats().find(c => c.id === chatId);
+          // For LID format, try to find the phone number from cached chats
+          const chats = await getCurrentChats();
+          const cachedChat = chats.find(c => c.id === chatId);
           
           if (cachedChat && cachedChat.phone) {
             // Use the phone number to send
-            const phoneId = cachedChat.phone + "@c.us";
-            console.log(`LID detected, using phone number: ${phoneId}`);
-            sentMessage = await whatsappClient.sendMessage(phoneId, message);
-          } else {
-            // Try direct send with LID
-            try {
-              sentMessage = await whatsappClient.sendMessage(chatId, message);
-            } catch (lidError) {
-              console.error("LID send failed:", lidError.message);
-              // Try getting chat by ID as fallback
-              const chat = await whatsappClient.getChatById(chatId);
+            targetId = cachedChat.phone + "@c.us";
+            console.log(`LID detected, using phone number: ${targetId}`);
+          }
+        }
+        
+        // Use client.sendMessage directly - more reliable
+        try {
+          sentMessage = await whatsappClient.sendMessage(targetId, message);
+        } catch (directError) {
+          console.log("Direct send failed, trying via chat object...", directError.message);
+          // Fallback: try getting chat by ID
+          try {
+            const chat = await whatsappClient.getChatById(chatId);
+            if (chat) {
               sentMessage = await chat.sendMessage(message);
             }
+          } catch (chatError) {
+            console.error("Chat send also failed:", chatError.message);
+            throw directError; // Throw the original error
           }
-        } else {
-          // Standard chat ID format
-          const chat = await whatsappClient.getChatById(chatId);
-          sentMessage = await chat.sendMessage(message);
         }
         
         console.log("Message sent successfully!");
         
+        // Handle response safely
         socket.emit("messageSent", { 
           success: true, 
           chatId,
-          messageId: sentMessage.id._serialized,
-          timestamp: sentMessage.timestamp
+          messageId: sentMessage?.id?._serialized || sentMessage?.id || "unknown",
+          timestamp: sentMessage?.timestamp || Date.now() / 1000
         });
 
       } catch (error) {
         console.error("Send message error:", error);
-        socket.emit("sendMessageError", { message: error.message });
+        socket.emit("sendMessageError", { message: error.message || "فشل إرسال الرسالة" });
       }
     });
 
@@ -1055,7 +1249,7 @@ app.prepare().then(() => {
     });
 
     // Sync all chats with streaming - Professional Edition
-    socket.on("syncAllChats", async ({ maxChats } = {}) => {
+    socket.on("syncAllChats", async ({ maxChats, incrementalOnly = false } = {}) => {
       if (!isReady) {
         console.log("Sync requested but WhatsApp not ready");
         socket.emit("chatsError", { message: "WhatsApp not ready" });
@@ -1086,7 +1280,7 @@ app.prepare().then(() => {
       syncCancelled = false;
 
       try {
-        console.log("Starting professional streaming sync...");
+        console.log("Starting enhanced streaming sync...");
         
         // Type labels for messages
         const typeLabels = {
@@ -1105,14 +1299,27 @@ app.prepare().then(() => {
         // Emit sync started
         socket.emit("syncProgress", { 
           status: "started", 
-          message: "🔄 بدء المزامنة الذكية...",
+          message: "🔄 بدء المزامنة المحسّنة...",
           progress: 1,
           total: 0,
           current: 0
         });
         
-        // Clear existing chats for fresh sync
-        socket.emit("syncClear");
+        // Update Convex sync status
+        if (isConvexReady()) {
+          await syncStatusDb.update(currentAccountId, {
+            status: "syncing",
+            progress: 1,
+            totalChats: 0,
+            syncedChats: 0,
+            message: "بدء المزامنة...",
+          }).catch(() => {});
+        }
+        
+        // Clear existing chats for fresh sync (unless incremental)
+        if (!incrementalOnly) {
+          socket.emit("syncClear");
+        }
         
         // Fetch all chats
         console.log("Fetching chat list...");
@@ -1137,6 +1344,12 @@ app.prepare().then(() => {
             total: 0,
             current: 0
           });
+          
+          // Log error to Convex
+          if (isConvexReady()) {
+            await syncStatusDb.fail(currentAccountId, error.message).catch(() => {});
+          }
+          
           syncInProgress = false;
           return;
         }
@@ -1163,7 +1376,12 @@ app.prepare().then(() => {
           return;
         }
 
-        console.log(`Processing ${totalChats} chats with streaming...`);
+        // Update Convex with total count
+        if (isConvexReady()) {
+          await syncStatusDb.startSync(currentAccountId, totalChats).catch(() => {});
+        }
+
+        console.log(`Processing ${totalChats} chats with enhanced streaming...`);
         socket.emit("syncProgress", { 
           status: "processing", 
           message: `🔍 تم العثور على ${totalChats} محادثة، جاري المعالجة...`,
@@ -1172,9 +1390,21 @@ app.prepare().then(() => {
           current: 0
         });
 
+        // Get existing chats for incremental sync comparison
+        let existingChatsMap = new Map();
+        if (incrementalOnly) {
+          const existingChats = getCurrentChatsSync();
+          existingChats.forEach(chat => existingChatsMap.set(chat.id, chat));
+        }
+
         const processedChats = [];
         let successCount = 0;
         let errorCount = 0;
+        let unchangedCount = 0;
+        
+        // Batch size for Convex updates
+        const CONVEX_BATCH_SIZE = 20;
+        let convexBatch = [];
 
         // Process chats one by one with streaming
         for (let i = 0; i < chatsToProcess.length; i++) {
@@ -1191,8 +1421,23 @@ app.prepare().then(() => {
           try {
             // Process single chat
             const processedChat = await processChat(chat, typeLabels);
+            
+            // Check if chat changed (for incremental sync)
+            if (incrementalOnly && existingChatsMap.has(processedChat.id)) {
+              const existing = existingChatsMap.get(processedChat.id);
+              if (existing.lastMessage?.timestamp === processedChat.lastMessage?.timestamp &&
+                  existing.unreadCount === processedChat.unreadCount) {
+                unchangedCount++;
+                processedChats.push(processedChat);
+                continue; // Skip unchanged chats
+              }
+            }
+            
             processedChats.push(processedChat);
             successCount++;
+            
+            // Add to Convex batch
+            convexBatch.push(processedChat);
 
             // Stream this chat immediately to the client
             socket.emit("syncChat", {
@@ -1213,6 +1458,26 @@ app.prepare().then(() => {
               current: i + 1,
               chatName: chatName
             });
+            
+            // Update Convex progress every 10 chats
+            if ((i + 1) % 10 === 0 && isConvexReady()) {
+              syncStatusDb.updateProgress(
+                currentAccountId, 
+                i + 1, 
+                totalChats, 
+                chatName
+              ).catch(() => {});
+            }
+            
+            // Batch save to Convex
+            if (convexBatch.length >= CONVEX_BATCH_SIZE) {
+              if (isConvexReady()) {
+                chatsDb.batchUpsert(currentAccountId, convexBatch).catch(e => 
+                  console.error("Error batch saving to Convex:", e.message)
+                );
+              }
+              convexBatch = [];
+            }
 
             // Log every 10 chats for performance
             if ((i + 1) % 10 === 0 || i === 0) {
@@ -1252,15 +1517,35 @@ app.prepare().then(() => {
           }
         }
 
+        // Save remaining batch to Convex
+        if (convexBatch.length > 0 && isConvexReady()) {
+          await chatsDb.batchUpsert(currentAccountId, convexBatch).catch(e => 
+            console.error("Error saving final batch to Convex:", e.message)
+          );
+        }
+
         // Update account chats
         setCurrentChats(processedChats);
 
         // Emit completion
-        const successMessage = errorCount > 0 
-          ? `✅ تم مزامنة ${successCount} محادثة (${errorCount} أخطاء)`
-          : `✅ تم مزامنة ${successCount} محادثة بنجاح!`;
+        let successMessage;
+        if (incrementalOnly && unchangedCount > 0) {
+          successMessage = `✅ تم تحديث ${successCount} محادثة (${unchangedCount} بدون تغيير)`;
+        } else if (errorCount > 0) {
+          successMessage = `✅ تم مزامنة ${successCount} محادثة (${errorCount} أخطاء)`;
+        } else {
+          successMessage = `✅ تم مزامنة ${successCount} محادثة بنجاح!`;
+        }
 
         console.log(successMessage);
+        
+        // Update Convex completion status
+        if (isConvexReady()) {
+          await syncStatusDb.complete(currentAccountId, totalChats).catch(() => {});
+          eventsDb.log(currentAccountId, "sync_complete", 
+            `Synced ${successCount} chats, ${errorCount} errors`
+          ).catch(() => {});
+        }
         
         socket.emit("syncProgress", { 
           status: "completed", 
@@ -1269,16 +1554,21 @@ app.prepare().then(() => {
           total: totalChats,
           current: totalChats,
           successCount: successCount,
-          errorCount: errorCount
+          errorCount: errorCount,
+          unchangedCount: unchangedCount
+        });
+
+        // Broadcast to all clients that sync is complete
+        io.emit("syncComplete", { 
+          total: processedChats.length,
+          success: successCount,
+          errors: errorCount,
+          unchanged: unchangedCount
         });
 
         // Send complete chats array as final confirmation
-        socket.emit("chats", getCurrentChats());
-        socket.emit("syncComplete", { 
-          total: getCurrentChats().length,
-          success: successCount,
-          errors: errorCount
-        });
+        const finalChats = await getCurrentChats();
+        socket.emit("chats", finalChats);
 
       } catch (error) {
         console.error("Sync error:", error);
@@ -1290,6 +1580,11 @@ app.prepare().then(() => {
           current: 0
         });
         socket.emit("chatsError", { message: error.message });
+        
+        // Log error to Convex
+        if (isConvexReady()) {
+          await syncStatusDb.fail(currentAccountId, error.message).catch(() => {});
+        }
       } finally {
         syncInProgress = false;
         syncCancelled = false;
@@ -1332,6 +1627,9 @@ app.prepare().then(() => {
           total: quickUpdates.length,
           current: quickUpdates.length
         });
+        
+        // Broadcast quick sync updates to all clients
+        io.emit("quickSyncComplete", { count: quickUpdates.length });
 
       } catch (error) {
         console.error("Quick sync error:", error);
@@ -1339,18 +1637,162 @@ app.prepare().then(() => {
       }
     });
 
+    // Incremental sync - only syncs changed chats
+    socket.on("incrementalSync", async () => {
+      if (!isReady) {
+        socket.emit("chatsError", { message: "WhatsApp not ready" });
+        return;
+      }
+
+      console.log("Starting incremental sync...");
+      socket.emit("syncProgress", {
+        status: "incremental",
+        message: "🔄 مزامنة تدريجية...",
+        progress: 10,
+        total: 0,
+        current: 0
+      });
+
+      // Trigger incremental sync
+      socket.emit("syncAllChats", { incrementalOnly: true });
+    });
+
+    // Get sync status from Convex
+    socket.on("getSyncStatus", async () => {
+      if (!isConvexReady()) {
+        socket.emit("syncStatusData", null);
+        return;
+      }
+
+      try {
+        const status = await syncStatusDb.get(currentAccountId);
+        socket.emit("syncStatusData", status);
+      } catch (e) {
+        console.error("Error getting sync status:", e.message);
+        socket.emit("syncStatusData", null);
+      }
+    });
+
+    // Force sync from Convex (load cached data)
+    socket.on("loadFromCloud", async () => {
+      if (!isConvexReady()) {
+        socket.emit("chatsError", { message: "Convex not ready" });
+        return;
+      }
+
+      try {
+        console.log("Loading chats from Convex...");
+        socket.emit("syncProgress", {
+          status: "loading",
+          message: "☁️ جاري التحميل من السحابة...",
+          progress: 50,
+          total: 0,
+          current: 0
+        });
+
+        const cloudChats = await chatsDb.getByAccountId(currentAccountId);
+        
+        if (cloudChats && cloudChats.length > 0) {
+          accountChats.set(currentAccountId, cloudChats);
+          socket.emit("chats", cloudChats);
+          socket.emit("syncProgress", {
+            status: "completed",
+            message: `☁️ تم تحميل ${cloudChats.length} محادثة من السحابة`,
+            progress: 100,
+            total: cloudChats.length,
+            current: cloudChats.length
+          });
+          console.log(`Loaded ${cloudChats.length} chats from Convex`);
+        } else {
+          socket.emit("syncProgress", {
+            status: "completed",
+            message: "📭 لا توجد محادثات في السحابة",
+            progress: 100,
+            total: 0,
+            current: 0
+          });
+        }
+      } catch (error) {
+        console.error("Error loading from Convex:", error);
+        socket.emit("chatsError", { message: error.message });
+      }
+    });
+
     // ==================== Account Management ====================
     
-    // Get all accounts
-    socket.on("getAccounts", () => {
-      console.log("Getting accounts...");
-      socket.emit("accounts", accounts);
+    // Get all accounts (filtered by userId if provided)
+    socket.on("getAccounts", (data) => {
+      const userId = data?.userId;
+      console.log("Getting accounts...", userId ? `for user: ${userId}` : "all");
+      
+      let filteredAccounts = accounts;
+      
+      // If userId is provided, filter accounts by userId
+      if (userId) {
+        // Get accounts that belong to this user OR have no userId (legacy accounts)
+        filteredAccounts = accounts.filter(a => !a.userId || a.userId === userId);
+        
+        // If there are legacy accounts (without userId), assign them to this user (first login gets them)
+        // This is for admin user who had accounts before userId was implemented
+        const legacyAccounts = filteredAccounts.filter(a => !a.userId);
+        if (legacyAccounts.length > 0) {
+          console.log(`Found ${legacyAccounts.length} legacy accounts, keeping for user`);
+          // Don't auto-assign to maintain backward compatibility
+        }
+        
+        // ONLY create new account if NO accounts exist at all for this user
+        if (filteredAccounts.length === 0) {
+          console.log("No accounts for user, creating default account...");
+          const defaultAccount = {
+            id: `account_${Date.now()}`,
+            name: "حسابي",
+            phone: null,
+            isActive: true,
+            userId: userId
+          };
+          accounts.push(defaultAccount);
+          saveAccounts(accounts);
+          filteredAccounts = [defaultAccount];
+          
+          // Set as current account
+          currentAccountId = defaultAccount.id;
+          
+          // Initialize this account (request QR) - ONLY for NEW accounts
+          setTimeout(() => {
+            initializeAccount(defaultAccount.id);
+          }, 500);
+        } else {
+          // Use existing active account or first available
+          const activeAccount = filteredAccounts.find(a => a.isActive) || filteredAccounts[0];
+          if (activeAccount && currentAccountId !== activeAccount.id) {
+            console.log("Using existing account:", activeAccount.id);
+            currentAccountId = activeAccount.id;
+            
+            // Check if this account already has a ready client
+            const existingClient = whatsappClients.get(activeAccount.id);
+            const isClientReady = clientReadyStates.get(activeAccount.id);
+            
+            if (existingClient && isClientReady) {
+              console.log("Client already ready for this account");
+              isReady = true;
+              whatsappClient = existingClient;
+              socket.emit("status", { isReady: true });
+            } else {
+              // Initialize the account
+              console.log("Initializing existing account...");
+              initializeAccount(activeAccount.id);
+            }
+          }
+        }
+      }
+      
+      socket.emit("accounts", filteredAccounts);
       socket.emit("currentAccount", currentAccountId);
     });
 
     // Add new account
-    socket.on("addAccount", ({ name }) => {
-      console.log("Adding new account:", name);
+    socket.on("addAccount", ({ name, userId }) => {
+      console.log("Adding new account:", name, "for user:", userId);
       
       if (!name || !name.trim()) {
         console.log("Account name is empty, ignoring");
@@ -1361,7 +1803,8 @@ app.prepare().then(() => {
         id: `account_${Date.now()}`,
         name: name.trim(),
         phone: null,
-        isActive: false
+        isActive: false,
+        userId: userId || null
       };
       
       accounts.push(newAccount);
@@ -1369,7 +1812,14 @@ app.prepare().then(() => {
       
       console.log("Account added successfully:", newAccount.id);
       socket.emit("accountAdded", newAccount);
-      socket.emit("accounts", accounts);
+      
+      // Send filtered accounts based on userId
+      if (userId) {
+        const filteredAccounts = accounts.filter(a => !a.userId || a.userId === userId);
+        socket.emit("accounts", filteredAccounts);
+      } else {
+        socket.emit("accounts", accounts);
+      }
     });
 
     // Switch to different account

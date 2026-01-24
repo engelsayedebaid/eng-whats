@@ -402,8 +402,12 @@ export default function ChatWindow({ chatId }: { chatId: string | null }) {
       <div
         className="flex-1 overflow-y-auto p-4 space-y-2"
         style={{
-          backgroundImage: "url('/chat-bg.png')",
-          backgroundSize: "cover",
+          backgroundColor: "#0b141a",
+          backgroundImage: `
+            linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px)
+          `,
+          backgroundSize: "20px 20px",
         }}
       >
         {chatMessages.length === 0 ? (

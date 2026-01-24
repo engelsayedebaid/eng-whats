@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Cairo, Poppins } from "next/font/google";
 import "./globals.css";
 import { SocketProvider } from "@/context/SocketContext";
+import { AuthProvider } from "@/context/AuthContext";
 
 const cairo = Cairo({
   variable: "--font-arabic",
@@ -28,8 +29,11 @@ export default function RootLayout({
   return (
     <html lang="ar" dir="rtl">
       <body className={`${cairo.variable} font-sans antialiased bg-[#0b141a]`}>
-        <SocketProvider>{children}</SocketProvider>
+        <AuthProvider>
+          <SocketProvider>{children}</SocketProvider>
+        </AuthProvider>
       </body>
     </html>
   );
 }
+

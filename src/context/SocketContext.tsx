@@ -81,6 +81,7 @@ interface Account {
   name: string;
   phone: string | null;
   isActive: boolean;
+  userId?: string;
 }
 
 interface SocketContextType {
@@ -129,6 +130,21 @@ const defaultSearchState: SearchState = {
 
 const SocketContext = createContext<SocketContextType | null>(null);
 
+// Get current user from localStorage
+function getCurrentUserId(): string | null {
+  if (typeof window === 'undefined') return null;
+  const stored = localStorage.getItem('whatsapp_pro_auth');
+  if (stored) {
+    try {
+      const user = JSON.parse(stored);
+      return user.id || null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export function SocketProvider({ children }: { children: ReactNode }) {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -143,6 +159,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
 
   useEffect(() => {
     // Get backend URL from environment variable or default to current origin
@@ -172,8 +189,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       console.log("Socket.io connected successfully! Transport:", newSocket.io.engine.transport.name);
       setIsConnected(true);
       setConnectionError(null);
-      // Request accounts on connect
-      newSocket.emit("getAccounts");
+      // Get current userId and request accounts
+      const currentUserId = getCurrentUserId();
+      setUserId(currentUserId);
+      // Request accounts filtered by userId
+      newSocket.emit("getAccounts", { userId: currentUserId });
     });
 
     newSocket.on("disconnect", (reason) => {
@@ -539,7 +559,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
   const addAccount = useCallback((name: string) => {
     if (socket) {
-      socket.emit("addAccount", { name });
+      const currentUserId = getCurrentUserId();
+      socket.emit("addAccount", { name, userId: currentUserId });
     }
   }, [socket]);
 
