@@ -998,23 +998,43 @@ app.prepare().then(() => {
           }
         }
         
-        // Method 3: Use pupPage directly (last resort)
+        // Method 3: Use pupPage directly with WWebJS injected methods (last resort)
         if (!sentMessage && whatsappClient.pupPage) {
           try {
             console.log("Trying pupPage method...");
             const result = await whatsappClient.pupPage.evaluate(async (to, msg) => {
-              const chatWid = window.Store.WidFactory.createWid(to);
-              const chat = await window.Store.Chat.find(chatWid);
-              if (chat) {
-                await chat.sendMessage(msg);
-                return { success: true };
+              try {
+                // Use the injected WWebJS method
+                if (window.WWebJS && window.WWebJS.sendMessage) {
+                  const chatWid = window.Store.WidFactory.createWid(to);
+                  await window.WWebJS.sendMessage(chatWid, msg, {});
+                  return { success: true, method: 'WWebJS' };
+                }
+                
+                // Fallback: Try direct Store methods
+                const chatWid = window.Store.WidFactory.createWid(to);
+                const chat = await window.Store.Chat.find(chatWid);
+                if (chat) {
+                  // Use the proper method to send message
+                  const msgModel = new window.Store.MsgModel({
+                    body: msg,
+                    type: 'chat',
+                    to: chatWid,
+                  });
+                  await window.Store.SendMessage.sendMsgToChat(chat, msg);
+                  return { success: true, method: 'Store' };
+                }
+                return { success: false, error: 'Chat not found' };
+              } catch (err) {
+                return { success: false, error: err.message };
               }
-              return { success: false };
             }, targetId, message);
             
             if (result && result.success) {
-              console.log("Message sent via pupPage");
+              console.log(`Message sent via pupPage (${result.method})`);
               sentMessage = { id: { _serialized: `manual_${Date.now()}` }, timestamp: Date.now() / 1000 };
+            } else {
+              console.log("pupPage method returned:", result);
             }
           } catch (e) {
             console.log("Method 3 failed:", e.message);
