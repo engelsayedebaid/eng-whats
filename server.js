@@ -467,7 +467,9 @@ app.prepare().then(() => {
     });
 
     client.on("message", async (message) => {
+      // Skip if not current account or client not ready
       if (currentAccountId !== accountId) return;
+      if (!clientReadyStates.get(accountId)) return;
       
       console.log("New message received from:", message.from);
       
@@ -477,11 +479,16 @@ app.prepare().then(() => {
       let isGroup = message.from.includes("@g.us");
       
       try {
+        // Check again if client is still ready before async operations
+        if (!clientReadyStates.get(accountId)) return;
+        
         const contact = await message.getContact();
         senderName = contact.pushname || contact.name || senderPhone;
         
         // Try to get chat info for chat name
         try {
+          if (!clientReadyStates.get(accountId)) return;
+          
           const chat = await message.getChat();
           chatName = chat.name || senderName;
           isGroup = chat.isGroup || false;
@@ -509,10 +516,14 @@ app.prepare().then(() => {
             }
           }
         } catch (e) {
-          // Use sender name as chat name if chat fetch fails
-          chatName = senderName;
+          // Use sender name as chat name if chat fetch fails (ignore context destroyed errors)
+          if (!e.message?.includes('context was destroyed')) {
+            chatName = senderName;
+          }
         }
-      } catch (e) {}
+      } catch (e) {
+        // Silently ignore context destroyed errors
+      }
       
       const typeLabels = {
         chat: "نص",
@@ -1276,15 +1287,40 @@ app.prepare().then(() => {
     socket.on("logout", async () => {
       try {
         console.log("Logout requested...");
-        await whatsappClient.logout();
+        
+        // Mark as not ready immediately to prevent new operations
         isReady = false;
-        setCurrentChats([]); // مسح المحادثات من الذاكرة
+        clientReadyStates.set(currentAccountId, false);
         io.emit("status", { isReady: false });
+        
+        // Clear chats from memory
+        setCurrentChats([]);
+        
+        // Try to logout gracefully
+        if (whatsappClient) {
+          try {
+            await whatsappClient.logout();
+            console.log("Logout successful");
+          } catch (logoutError) {
+            // Ignore errors during logout - context might already be destroyed
+            console.log("Logout completed with warning:", logoutError.message);
+          }
+          
+          // Clean up the client
+          try {
+            await whatsappClient.destroy();
+          } catch (e) {
+            // Ignore destroy errors
+          }
+          
+          whatsappClients.delete(currentAccountId);
+          clientReadyStates.delete(currentAccountId);
+        }
+        
         io.emit("logout");
-        console.log("Logout successful");
       } catch (error) {
-        console.error("Logout error:", error);
-        // حتى لو حدث خطأ، نرسل event logout لمسح البيانات في الواجهة
+        console.error("Logout error:", error.message);
+        // Even on error, send logout event to clear frontend data
         isReady = false;
         setCurrentChats([]);
         io.emit("status", { isReady: false });
@@ -2395,14 +2431,42 @@ app.prepare().then(() => {
 
   // Error handlers for unhandled rejections
   process.on('unhandledRejection', (error) => {
-    console.error('Unhandled Rejection:', error);
-    if (error.message && error.message.includes('Target closed')) {
-      console.log('Browser target closed, this is usually harmless');
+    // Ignore common browser-related errors that are harmless
+    const harmlessErrors = [
+      'Target closed',
+      'Execution context was destroyed',
+      'Protocol error',
+      'Session closed',
+      'frame was detached',
+      'Navigation timeout',
+      'net::ERR_'
+    ];
+    
+    const errorMsg = error?.message || String(error);
+    const isHarmless = harmlessErrors.some(e => errorMsg.includes(e));
+    
+    if (isHarmless) {
+      console.log('Browser context error (harmless):', errorMsg.substring(0, 100));
+    } else {
+      console.error('Unhandled Rejection:', error);
     }
   });
 
   process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
+    const harmlessErrors = [
+      'Execution context was destroyed',
+      'Target closed',
+      'Protocol error'
+    ];
+    
+    const errorMsg = error?.message || String(error);
+    const isHarmless = harmlessErrors.some(e => errorMsg.includes(e));
+    
+    if (isHarmless) {
+      console.log('Browser exception (harmless):', errorMsg.substring(0, 100));
+    } else {
+      console.error('Uncaught Exception:', error);
+    }
   });
 
   // Initialize current account's WhatsApp client
