@@ -1024,326 +1024,654 @@ app.prepare().then(() => {
       }
     });
 
-    // Request to get messages for a specific chat (with media support)
+    // Messages cache for fallback
+    const messagesCache = new Map();
+    
+    // Helper: Check if client is truly ready
+    const isClientReady = () => {
+      return isReady && 
+             whatsappClient && 
+             whatsappClient.pupPage && 
+             clientReadyStates.get(currentAccountId);
+    };
+    
+    // Helper: Wait with promise
+    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    
+    // Helper: Safe operation with timeout
+    const safeOperation = async (operation, timeoutMs = 15000, fallback = null) => {
+      try {
+        return await Promise.race([
+          operation(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Operation timeout')), timeoutMs)
+          )
+        ]);
+      } catch (e) {
+        return fallback;
+      }
+    };
+    
+    // Helper: Format single message safely
+    const formatMessageSafe = async (msg, chat, skipMedia = false) => {
+      try {
+        const messageData = {
+          id: msg?.id?._serialized || msg?.id || `temp_${Date.now()}_${Math.random()}`,
+          body: msg?.body ?? '',
+          fromMe: msg?.fromMe ?? false,
+          timestamp: msg?.timestamp ?? Math.floor(Date.now() / 1000),
+          type: msg?.type ?? 'chat',
+          hasMedia: msg?.hasMedia ?? false,
+          mediaUrl: null,
+          mimetype: null,
+          filename: null,
+          duration: null,
+          senderName: null,
+          mediaError: false,
+        };
+        
+        // Get sender name for group messages
+        if (!messageData.fromMe && chat?.isGroup && msg?.author) {
+          messageData.senderName = await safeOperation(
+            async () => {
+              const contact = await msg.getContact();
+              return contact?.pushname || contact?.name || msg.author?.split("@")[0] || "مجهول";
+            },
+            5000,
+            msg.author?.split("@")[0] || "مجهول"
+          );
+        }
+        
+        // Fetch media if available (with multiple retries)
+        if (messageData.hasMedia && !skipMedia && isClientReady()) {
+          for (let mediaAttempt = 0; mediaAttempt < 3; mediaAttempt++) {
+            const media = await safeOperation(
+              () => msg.downloadMedia(),
+              10000,
+              null
+            );
+            if (media?.data) {
+              messageData.mediaUrl = `data:${media.mimetype || 'application/octet-stream'};base64,${media.data}`;
+              messageData.mimetype = media.mimetype;
+              messageData.filename = media.filename;
+              break;
+            }
+            if (mediaAttempt < 2) await wait(500);
+          }
+          if (!messageData.mediaUrl) {
+            messageData.mediaError = true;
+          }
+        } else if (messageData.hasMedia) {
+          messageData.mediaError = true;
+        }
+        
+        // Get duration for audio/video
+        if (msg?.type === "ptt" || msg?.type === "audio") {
+          messageData.duration = msg?.duration || null;
+        }
+        
+        return messageData;
+      } catch (e) {
+        // Return minimal message data on error
+        return {
+          id: `error_${Date.now()}_${Math.random()}`,
+          body: msg?.body ?? '',
+          fromMe: msg?.fromMe ?? false,
+          timestamp: msg?.timestamp ?? Math.floor(Date.now() / 1000),
+          type: msg?.type ?? 'chat',
+          hasMedia: false,
+          mediaUrl: null,
+          mimetype: null,
+          filename: null,
+          duration: null,
+          senderName: null,
+          mediaError: false,
+        };
+      }
+    };
+
+    // Request to get messages for a specific chat (with media support) - PROFESSIONAL INFINITE RETRY
     socket.on("getMessages", async ({ chatId, limit = 50 }) => {
-      if (!isReady) {
-        socket.emit("messagesError", { message: "WhatsApp not ready" });
+      const MAX_RETRIES = 100; // كثير جداً لضمان عدم الفشل
+      const INITIAL_DELAY = 500;
+      const MAX_DELAY = 10000;
+      
+      let attempt = 0;
+      let lastError = null;
+      let partialMessages = [];
+      
+      // Send loading status
+      socket.emit("messagesLoading", { chatId, status: "جاري التحميل..." });
+      
+      while (attempt < MAX_RETRIES) {
+        attempt++;
+        
+        // Strategy 1: Direct fetch if client is ready
+        if (isClientReady()) {
+          try {
+            // Method A: getChatById then fetchMessages
+            const chat = await safeOperation(
+              () => whatsappClient.getChatById(chatId),
+              20000,
+              null
+            );
+            
+            if (chat) {
+              const messages = await safeOperation(
+                () => chat.fetchMessages({ limit }),
+                30000,
+                null
+              );
+              
+              if (messages && Array.isArray(messages) && messages.length > 0) {
+                // Format messages in batches to avoid overwhelming
+                const BATCH_SIZE = 10;
+                const formattedMessages = [];
+                
+                for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+                  if (!isClientReady()) break; // Stop if client disconnected
+                  
+                  const batch = messages.slice(i, i + BATCH_SIZE);
+                  const formattedBatch = await Promise.all(
+                    batch.map(msg => formatMessageSafe(msg, chat, false))
+                  );
+                  formattedMessages.push(...formattedBatch);
+                  
+                  // Send progress
+                  socket.emit("messagesLoading", { 
+                    chatId, 
+                    status: `جاري التحميل ${Math.min(i + BATCH_SIZE, messages.length)}/${messages.length}` 
+                  });
+                }
+                
+                if (formattedMessages.length > 0) {
+                  // Cache successful result
+                  messagesCache.set(chatId, {
+                    messages: formattedMessages,
+                    timestamp: Date.now()
+                  });
+                  
+                  socket.emit("messages", { chatId, messages: formattedMessages });
+                  return; // Success!
+                }
+              }
+            }
+          } catch (e) {
+            lastError = e;
+          }
+        }
+        
+        // Strategy 2: Try getting from client's chats directly
+        if (isClientReady() && attempt % 3 === 0) {
+          try {
+            const chats = await safeOperation(
+              () => whatsappClient.getChats(),
+              30000,
+              []
+            );
+            
+            const targetChat = chats?.find?.(c => c?.id?._serialized === chatId);
+            if (targetChat) {
+              const messages = await safeOperation(
+                () => targetChat.fetchMessages({ limit }),
+                30000,
+                null
+              );
+              
+              if (messages && Array.isArray(messages) && messages.length > 0) {
+                const formattedMessages = await Promise.all(
+                  messages.map(msg => formatMessageSafe(msg, targetChat, attempt > 5))
+                );
+                
+                messagesCache.set(chatId, {
+                  messages: formattedMessages,
+                  timestamp: Date.now()
+                });
+                
+                socket.emit("messages", { chatId, messages: formattedMessages });
+                return; // Success!
+              }
+            }
+          } catch (e) {
+            lastError = e;
+          }
+        }
+        
+        // Strategy 3: Return cached messages if available (after several attempts)
+        if (attempt >= 5) {
+          const cached = messagesCache.get(chatId);
+          if (cached && cached.messages && cached.messages.length > 0) {
+            // Check cache age (use if less than 5 minutes old)
+            if (Date.now() - cached.timestamp < 5 * 60 * 1000) {
+              socket.emit("messages", { 
+                chatId, 
+                messages: cached.messages,
+                fromCache: true 
+              });
+              return; // Success from cache!
+            }
+          }
+        }
+        
+        // Strategy 4: Wait for client to become ready
+        if (!isClientReady()) {
+          socket.emit("messagesLoading", { 
+            chatId, 
+            status: `انتظار اتصال واتساب... (${attempt})` 
+          });
+          
+          // Wait for client with checking
+          let waitTime = 0;
+          while (!isClientReady() && waitTime < 30000) {
+            await wait(1000);
+            waitTime += 1000;
+          }
+          
+          if (isClientReady()) {
+            continue; // Client ready, retry immediately
+          }
+        }
+        
+        // Calculate delay with exponential backoff (capped)
+        const delay = Math.min(INITIAL_DELAY * Math.pow(1.5, attempt - 1), MAX_DELAY);
+        
+        // Emit retry status every few attempts
+        if (attempt % 5 === 0) {
+          socket.emit("messagesLoading", { 
+            chatId, 
+            status: `محاولة ${attempt}... جاري المحاولة` 
+          });
+        }
+        
+        await wait(delay);
+      }
+      
+      // If we got here, all retries failed - try cache one last time
+      const cached = messagesCache.get(chatId);
+      if (cached && cached.messages && cached.messages.length > 0) {
+        socket.emit("messages", { 
+          chatId, 
+          messages: cached.messages,
+          fromCache: true,
+          cacheAge: Date.now() - cached.timestamp
+        });
         return;
       }
-
-      try {
-        const chat = await whatsappClient.getChatById(chatId);
-        const messages = await chat.fetchMessages({ limit });
-        
-        const formattedMessages = await Promise.all(
-          messages.map(async (msg) => {
-            const messageData = {
-              id: msg.id._serialized,
-              body: msg.body,
-              fromMe: msg.fromMe,
-              timestamp: msg.timestamp,
-              type: msg.type,
-              hasMedia: msg.hasMedia || false,
-              mediaUrl: null,
-              mimetype: null,
-              filename: null,
-              duration: null,
-              senderName: null,
-            };
-            
-            // Get sender name for group messages
-            if (!msg.fromMe && chat.isGroup) {
-              try {
-                const contact = await msg.getContact();
-                messageData.senderName = contact.pushname || contact.name || msg.author?.split("@")[0] || "مجهول";
-              } catch (e) {
-                messageData.senderName = msg.author?.split("@")[0] || "مجهول";
-              }
-            }
-            
-            // Fetch media if available (with timeout and safety checks)
-            if (msg.hasMedia && isReady && whatsappClient?.pupPage) {
-              try {
-                // Add timeout to prevent hanging on Protocol errors
-                const media = await Promise.race([
-                  msg.downloadMedia(),
-                  new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Media download timeout')), 10000)
-                  )
-                ]);
-                if (media) {
-                  messageData.mediaUrl = `data:${media.mimetype};base64,${media.data}`;
-                  messageData.mimetype = media.mimetype;
-                  messageData.filename = media.filename;
-                }
-              } catch (e) {
-                // Only log non-Protocol errors (Protocol errors are common when browser is busy)
-                if (!e.message.includes('Protocol error') && !e.message.includes('Target closed') && !e.message.includes('timeout')) {
-                  console.error("Error downloading media:", e.message);
-                }
-                // Mark that media exists but couldn't be downloaded
-                messageData.mediaError = true;
-              }
-            } else if (msg.hasMedia) {
-              // Media exists but client not ready
-              messageData.mediaError = true;
-            }
-            
-            // Get duration for audio/video
-            if (msg.type === "ptt" || msg.type === "audio") {
-              try {
-                messageData.duration = msg.duration || null;
-              } catch (e) {
-                // Ignore
-              }
-            }
-            
-            return messageData;
-          })
-        );
-        
-        socket.emit("messages", { chatId, messages: formattedMessages });
-      } catch (error) {
-        console.error("Error fetching messages:", error);
-        socket.emit("messagesError", { message: error.message });
-      }
+      
+      // Absolute last resort: send empty with info
+      socket.emit("messages", { 
+        chatId, 
+        messages: [],
+        error: "تعذر جلب الرسائل بعد محاولات عديدة",
+        retryable: true
+      });
     });
 
-    // Send message
+    // Send message - PROFESSIONAL INFINITE RETRY
     socket.on("sendMessage", async ({ chatId, message }) => {
-      if (!isReady) {
-        socket.emit("sendMessageError", { message: "WhatsApp not ready" });
-        return;
-      }
-
       if (!chatId || !message) {
         socket.emit("sendMessageError", { message: "Chat ID and message are required" });
         return;
       }
 
-      try {
-        console.log(`Sending message to ${chatId}: ${message.substring(0, 50)}...`);
-        
-        let targetId = chatId;
-        
-        // Check if it's a LID format (Linked ID) - new WhatsApp format
-        if (chatId.includes("@lid")) {
-          // For LID format, try to find the phone number from cached chats
+      const MAX_RETRIES = 50;
+      const INITIAL_DELAY = 500;
+      const MAX_DELAY = 5000;
+      
+      let attempt = 0;
+      let sentMessage = null;
+      let lastError = null;
+      
+      // Send status
+      socket.emit("sendMessageStatus", { chatId, status: "جاري الإرسال..." });
+      
+      // Prepare target ID
+      let targetId = chatId;
+      if (chatId.includes("@lid")) {
+        try {
           const chats = await getCurrentChats();
-          const cachedChat = chats.find(c => c.id === chatId);
-          
-          if (cachedChat && cachedChat.phone) {
-            // Use the phone number to send
+          const cachedChat = chats?.find?.(c => c?.id === chatId);
+          if (cachedChat?.phone) {
             targetId = cachedChat.phone + "@c.us";
-            console.log(`LID detected, using phone number: ${targetId}`);
+          }
+        } catch (e) {
+          // Use original chatId
+        }
+      }
+      
+      while (attempt < MAX_RETRIES && !sentMessage) {
+        attempt++;
+        
+        // Wait for client to be ready
+        if (!isClientReady()) {
+          socket.emit("sendMessageStatus", { chatId, status: `انتظار الاتصال... (${attempt})` });
+          
+          let waitTime = 0;
+          while (!isClientReady() && waitTime < 30000) {
+            await wait(1000);
+            waitTime += 1000;
+          }
+          
+          if (!isClientReady()) {
+            const delay = Math.min(INITIAL_DELAY * Math.pow(1.5, attempt - 1), MAX_DELAY);
+            await wait(delay);
+            continue;
           }
         }
         
-        // Try multiple methods to send the message
-        let sentMessage = null;
-        let lastError = null;
-        
         // Method 1: Direct sendMessage (simplest)
         try {
-          sentMessage = await whatsappClient.sendMessage(targetId, message);
+          sentMessage = await safeOperation(
+            () => whatsappClient.sendMessage(targetId, message),
+            20000,
+            null
+          );
           if (sentMessage) {
             console.log("Message sent via direct method");
+            break;
           }
         } catch (e) {
-          console.log("Method 1 failed:", e.message);
           lastError = e;
         }
         
         // Method 2: Get chat first, then send
-        if (!sentMessage) {
+        if (!sentMessage && isClientReady()) {
           try {
-            const chat = await whatsappClient.getChatById(targetId);
+            const chat = await safeOperation(
+              () => whatsappClient.getChatById(targetId),
+              15000,
+              null
+            );
             if (chat && typeof chat.sendMessage === 'function') {
-              sentMessage = await chat.sendMessage(message);
+              sentMessage = await safeOperation(
+                () => chat.sendMessage(message),
+                15000,
+                null
+              );
               if (sentMessage) {
                 console.log("Message sent via chat.sendMessage");
+                break;
               }
             }
           } catch (e) {
-            console.log("Method 2 failed:", e.message);
             lastError = e;
           }
         }
         
-        // Method 3: Use pupPage directly with WWebJS injected methods (last resort)
-        if (!sentMessage && whatsappClient.pupPage) {
+        // Method 3: Use pupPage directly with WWebJS injected methods
+        if (!sentMessage && whatsappClient?.pupPage) {
           try {
-            console.log("Trying pupPage method...");
-            const result = await whatsappClient.pupPage.evaluate(async (to, msg) => {
-              try {
-                // Use the injected WWebJS method
-                if (window.WWebJS && window.WWebJS.sendMessage) {
+            const result = await safeOperation(async () => {
+              return await whatsappClient.pupPage.evaluate(async (to, msg) => {
+                try {
+                  if (window.WWebJS && window.WWebJS.sendMessage) {
+                    const chatWid = window.Store.WidFactory.createWid(to);
+                    await window.WWebJS.sendMessage(chatWid, msg, {});
+                    return { success: true, method: 'WWebJS' };
+                  }
+                  
                   const chatWid = window.Store.WidFactory.createWid(to);
-                  await window.WWebJS.sendMessage(chatWid, msg, {});
-                  return { success: true, method: 'WWebJS' };
+                  const chat = await window.Store.Chat.find(chatWid);
+                  if (chat) {
+                    await window.Store.SendMessage.sendMsgToChat(chat, msg);
+                    return { success: true, method: 'Store' };
+                  }
+                  return { success: false, error: 'Chat not found' };
+                } catch (err) {
+                  return { success: false, error: err.message };
                 }
-                
-                // Fallback: Try direct Store methods
-                const chatWid = window.Store.WidFactory.createWid(to);
-                const chat = await window.Store.Chat.find(chatWid);
-                if (chat) {
-                  // Use the proper method to send message
-                  const msgModel = new window.Store.MsgModel({
-                    body: msg,
-                    type: 'chat',
-                    to: chatWid,
-                  });
-                  await window.Store.SendMessage.sendMsgToChat(chat, msg);
-                  return { success: true, method: 'Store' };
-                }
-                return { success: false, error: 'Chat not found' };
-              } catch (err) {
-                return { success: false, error: err.message };
-              }
-            }, targetId, message);
+              }, targetId, message);
+            }, 15000, { success: false });
             
-            if (result && result.success) {
+            if (result?.success) {
               console.log(`Message sent via pupPage (${result.method})`);
               sentMessage = { id: { _serialized: `manual_${Date.now()}` }, timestamp: Date.now() / 1000 };
-            } else {
-              console.log("pupPage method returned:", result);
+              break;
             }
           } catch (e) {
-            console.log("Method 3 failed:", e.message);
             lastError = e;
           }
         }
         
-        if (sentMessage) {
-          console.log("Message sent successfully!");
-          socket.emit("messageSent", { 
-            success: true, 
-            chatId,
-            messageId: sentMessage?.id?._serialized || sentMessage?.id || `msg_${Date.now()}`,
-            timestamp: sentMessage?.timestamp || Date.now() / 1000
-          });
-        } else {
-          throw lastError || new Error("All send methods failed");
+        // Method 4: Try with original chatId if different
+        if (!sentMessage && targetId !== chatId && isClientReady()) {
+          try {
+            sentMessage = await safeOperation(
+              () => whatsappClient.sendMessage(chatId, message),
+              15000,
+              null
+            );
+            if (sentMessage) {
+              console.log("Message sent via original chatId");
+              break;
+            }
+          } catch (e) {
+            lastError = e;
+          }
         }
-
-      } catch (error) {
-        console.error("Send message error:", error);
-        socket.emit("sendMessageError", { message: error.message || "فشل إرسال الرسالة" });
+        
+        // Update status every few attempts
+        if (attempt % 5 === 0) {
+          socket.emit("sendMessageStatus", { chatId, status: `محاولة ${attempt}...` });
+        }
+        
+        // Delay before next attempt
+        const delay = Math.min(INITIAL_DELAY * Math.pow(1.3, attempt - 1), MAX_DELAY);
+        await wait(delay);
+      }
+      
+      if (sentMessage) {
+        console.log("Message sent successfully!");
+        socket.emit("messageSent", { 
+          success: true, 
+          chatId,
+          messageId: sentMessage?.id?._serialized || sentMessage?.id || `msg_${Date.now()}`,
+          timestamp: sentMessage?.timestamp || Date.now() / 1000
+        });
+      } else {
+        // Final failure after all retries
+        socket.emit("sendMessageError", { 
+          message: "فشل الإرسال - حاول مرة أخرى",
+          retryable: true,
+          attempts: attempt
+        });
       }
     });
 
-    // Search messages across all chats
+    // Search cache for results
+    const searchResultsCache = new Map();
+    
+    // Search messages across all chats - PROFESSIONAL WITH RETRY
     socket.on("searchMessages", async ({ query, maxChats = 50, maxMessagesPerChat = 30 }) => {
-      if (!isReady) {
-        socket.emit("searchProgress", { status: "error", message: "واتساب غير جاهز", progress: 0 });
-        socket.emit("searchResults", { results: [], query: "" });
-        return;
-      }
-
       if (!query || query.trim().length < 2) {
         socket.emit("searchResults", { results: [], query: "" });
         return;
       }
 
-      try {
-        console.log(`Searching for: "${query}"`);
-        
-        socket.emit("searchProgress", { 
-          status: "searching", 
-          message: `جاري البحث عن "${query}"...`,
-          progress: 5
-        });
+      const queryLower = query.toLowerCase().trim();
+      const cacheKey = `${queryLower}_${maxChats}_${maxMessagesPerChat}`;
+      
+      console.log(`Searching for: "${query}"`);
+      
+      socket.emit("searchProgress", { 
+        status: "searching", 
+        message: `جاري البحث عن "${query}"...`,
+        progress: 5
+      });
 
-        let allChats;
+      // Get chats with retry
+      let allChats = [];
+      for (let attempt = 0; attempt < 10; attempt++) {
+        if (!isClientReady()) {
+          socket.emit("searchProgress", { 
+            status: "searching", 
+            message: `انتظار الاتصال... (${attempt + 1})`,
+            progress: 5
+          });
+          await wait(2000);
+          continue;
+        }
+        
         try {
-          allChats = await whatsappClient.getChats();
+          allChats = await safeOperation(
+            () => whatsappClient.getChats(),
+            30000,
+            []
+          );
+          if (allChats && allChats.length > 0) break;
         } catch (e) {
-          console.error("Failed to get chats for search:", e.message);
-          socket.emit("searchProgress", { status: "error", message: "فشل جلب المحادثات", progress: 0 });
-          socket.emit("searchResults", { results: [], query });
+          // Continue retrying
+        }
+        
+        await wait(1000);
+      }
+      
+      // If still no chats, use cached chats
+      if (!allChats || allChats.length === 0) {
+        const cachedChats = await getCurrentChats();
+        if (cachedChats.length > 0) {
+          // Search in cached chat names only
+          const nameResults = cachedChats
+            .filter(c => c?.name?.toLowerCase()?.includes(queryLower))
+            .map(c => ({
+              id: `name_${c.id}`,
+              chatId: c.id,
+              chatName: c.name,
+              chatPhone: c.phone || c.id?.split("@")[0],
+              isGroup: c.isGroup || false,
+              body: `محادثة: ${c.name}`,
+              timestamp: c.timestamp || Date.now() / 1000,
+              fromMe: false,
+              senderName: c.name,
+              type: "name_match"
+            }));
+          
+          socket.emit("searchProgress", { 
+            status: "completed", 
+            message: `تم العثور على ${nameResults.length} نتيجة (من الذاكرة)`,
+            progress: 100
+          });
+          socket.emit("searchResults", { results: nameResults, query, fromCache: true });
           return;
         }
+        
+        // Check cache for previous search results
+        const cached = searchResultsCache.get(cacheKey);
+        if (cached) {
+          socket.emit("searchProgress", { 
+            status: "completed", 
+            message: `${cached.results.length} نتيجة (محفوظة)`,
+            progress: 100
+          });
+          socket.emit("searchResults", { ...cached, fromCache: true });
+          return;
+        }
+        
+        socket.emit("searchProgress", { status: "error", message: "لا يمكن الوصول للمحادثات", progress: 0 });
+        socket.emit("searchResults", { results: [], query });
+        return;
+      }
 
-        const searchResults = [];
-        const chatsToSearch = allChats.slice(0, maxChats);
-        const queryLower = query.toLowerCase();
-        const totalChats = chatsToSearch.length;
+      const searchResults = [];
+      const chatsToSearch = allChats.slice(0, maxChats);
+      const totalChats = chatsToSearch.length;
 
-        console.log(`Searching in ${totalChats} chats...`);
+      console.log(`Searching in ${totalChats} chats...`);
 
-        socket.emit("searchProgress", { 
-          status: "searching", 
-          message: `تم العثور على ${allChats.length} محادثة، جاري البحث...`,
-          progress: 10
-        });
+      socket.emit("searchProgress", { 
+        status: "searching", 
+        message: `تم العثور على ${allChats.length} محادثة، جاري البحث...`,
+        progress: 10
+      });
 
-        for (let i = 0; i < chatsToSearch.length; i++) {
-          const chat = chatsToSearch[i];
-          
-          try {
-            const messages = await chat.fetchMessages({ limit: maxMessagesPerChat });
-            
-            for (const msg of messages) {
-              if (msg.body && msg.body.toLowerCase().includes(queryLower)) {
-                const phoneNumber = chat.id._serialized.split("@")[0];
+      let skippedChats = 0;
+      for (let i = 0; i < chatsToSearch.length; i++) {
+        const chat = chatsToSearch[i];
+        
+        // Check client health periodically
+        if (i % 10 === 0 && !isClientReady()) {
+          console.log("Client disconnected during search, using partial results");
+          break;
+        }
+        
+        // Fetch messages with retry for each chat
+        let messages = null;
+        for (let msgAttempt = 0; msgAttempt < 3; msgAttempt++) {
+          messages = await safeOperation(
+            () => chat.fetchMessages({ limit: maxMessagesPerChat }),
+            15000,
+            null
+          );
+          if (messages) break;
+          await wait(300);
+        }
+        
+        if (messages && Array.isArray(messages)) {
+          for (const msg of messages) {
+            try {
+              if (msg?.body && msg.body.toLowerCase().includes(queryLower)) {
+                const phoneNumber = chat?.id?._serialized?.split("@")[0] || "unknown";
                 
                 let senderName = "أنا";
-                if (!msg.fromMe && chat.isGroup) {
+                if (!msg.fromMe && chat?.isGroup) {
                   senderName = msg.author ? msg.author.split("@")[0] : "مجهول";
                 } else if (!msg.fromMe) {
-                  senderName = chat.name || phoneNumber;
+                  senderName = chat?.name || phoneNumber;
                 }
                 
                 searchResults.push({
-                  id: msg.id._serialized,
-                  chatId: chat.id._serialized,
-                  chatName: chat.name || phoneNumber,
+                  id: msg?.id?._serialized || `msg_${Date.now()}_${Math.random()}`,
+                  chatId: chat?.id?._serialized || "",
+                  chatName: chat?.name || phoneNumber,
                   chatPhone: phoneNumber,
-                  isGroup: chat.isGroup || false,
+                  isGroup: chat?.isGroup || false,
                   body: msg.body,
-                  timestamp: msg.timestamp,
-                  fromMe: msg.fromMe,
+                  timestamp: msg.timestamp || Date.now() / 1000,
+                  fromMe: msg.fromMe ?? false,
                   senderName: senderName,
                   type: msg.type || "chat",
                 });
               }
+            } catch (e) {
+              // Skip this message
             }
-          } catch (e) {
-            // Skip this chat on error
-            console.log(`Skipping chat ${i + 1} due to error`);
           }
+        } else {
+          skippedChats++;
+        }
 
-          // Emit progress every chat
-          const progress = Math.round(10 + ((i + 1) / totalChats) * 85);
+        // Emit progress every chat
+        const progress = Math.round(10 + ((i + 1) / totalChats) * 85);
+        if (i % 5 === 0 || i === totalChats - 1) {
           socket.emit("searchProgress", { 
             status: "searching", 
             message: `جاري البحث... (${i + 1}/${totalChats})`,
             progress: progress
           });
         }
-
-        console.log(`Found ${searchResults.length} results for "${query}"`);
-        
-        // Sort by timestamp (newest first)
-        searchResults.sort((a, b) => b.timestamp - a.timestamp);
-        
-        socket.emit("searchProgress", { 
-          status: "completed", 
-          message: `تم العثور على ${searchResults.length} نتيجة`,
-          progress: 100
-        });
-
-        socket.emit("searchResults", { results: searchResults, query });
-
-      } catch (error) {
-        console.error("Search error:", error);
-        socket.emit("searchProgress", { 
-          status: "error", 
-          message: `خطأ: ${error.message}`,
-          progress: 0
-        });
-        socket.emit("searchResults", { results: [], query });
       }
+
+      console.log(`Found ${searchResults.length} results for "${query}" (skipped ${skippedChats} chats)`);
+      
+      // Sort by timestamp (newest first)
+      searchResults.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      
+      // Cache results
+      searchResultsCache.set(cacheKey, { results: searchResults, query, timestamp: Date.now() });
+      
+      // Limit cache size
+      if (searchResultsCache.size > 50) {
+        const oldestKey = searchResultsCache.keys().next().value;
+        searchResultsCache.delete(oldestKey);
+      }
+      
+      socket.emit("searchProgress", { 
+        status: "completed", 
+        message: `تم العثور على ${searchResults.length} نتيجة`,
+        progress: 100
+      });
+
+      socket.emit("searchResults", { results: searchResults, query });
     });
 
     // Logout
