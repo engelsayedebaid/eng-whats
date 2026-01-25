@@ -773,10 +773,17 @@ app.prepare().then(() => {
       // Helper to delay
       const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
       
-      // Retry function
+      // Retry function with better error handling
       const fetchWithRetry = async (retries = 3) => {
         for (let i = 0; i < retries; i++) {
           try {
+            // Check if client and page are still available
+            if (!whatsappClient || !whatsappClient.pupPage) {
+              console.log("Client or page not available, waiting...");
+              await delay(2000);
+              continue;
+            }
+            
             // Check if client info is available
             const info = whatsappClient.info;
             if (!info) {
@@ -795,6 +802,13 @@ app.prepare().then(() => {
             return allChats;
           } catch (error) {
             console.error(`Attempt ${i + 1} failed:`, error.message);
+            
+            // If it's a detached frame error, the page is gone - don't retry, use cache
+            if (error.message.includes('detached Frame') || error.message.includes('Target closed')) {
+              console.log("Browser page detached, returning cached data");
+              return null; // Signal to use cached data
+            }
+            
             if (i < retries - 1) {
               await delay(2000 * (i + 1)); // Exponential backoff
             } else {
@@ -802,14 +816,23 @@ app.prepare().then(() => {
             }
           }
         }
+        return null;
       };
 
       try {
         console.log("Fetching chats...");
         
         const allChats = await fetchWithRetry(3);
+        
+        // If fetch failed, use cached data
         if (!allChats) {
-          socket.emit("chatsError", { message: "Failed to fetch chats after retries" });
+          console.log("Using cached chats due to fetch failure");
+          const cached = await getCurrentChats();
+          if (cached.length > 0) {
+            socket.emit("chats", cached);
+            return;
+          }
+          socket.emit("chatsError", { message: "لا يمكن جلب المحادثات - حاول مرة أخرى" });
           return;
         }
         
@@ -1469,7 +1492,7 @@ app.prepare().then(() => {
           socket.emit("syncClear");
         }
         
-        // Fetch all chats
+        // Fetch all chats with retry logic
         console.log("Fetching chat list...");
         socket.emit("syncProgress", { 
           status: "fetching", 
@@ -1480,25 +1503,60 @@ app.prepare().then(() => {
         });
 
         let allChats;
-        try {
-          allChats = await whatsappClient.getChats();
-          console.log(`Found ${allChats.length} chats in ${Date.now() - syncStartTime}ms`);
-        } catch (error) {
-          console.error("Error fetching chats:", error);
-          socket.emit("syncProgress", { 
-            status: "error", 
-            message: `❌ خطأ في جلب المحادثات: ${error.message}`,
-            progress: 0,
-            total: 0,
-            current: 0
-          });
-          
-          if (isConvexReady()) {
-            await syncStatusDb.fail(currentAccountId, error.message).catch(() => {});
+        const maxRetries = 3;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          try {
+            // Check if client and page are available
+            if (!whatsappClient || !whatsappClient.pupPage) {
+              throw new Error("Client not ready");
+            }
+            
+            allChats = await whatsappClient.getChats();
+            console.log(`Found ${allChats.length} chats in ${Date.now() - syncStartTime}ms`);
+            break; // Success, exit retry loop
+          } catch (error) {
+            console.error(`Fetch attempt ${attempt} failed:`, error.message);
+            
+            // If it's a detached frame error, try to use cached data
+            if (error.message.includes('detached Frame') || error.message.includes('Target closed')) {
+              console.log("Browser page detached, trying cached data...");
+              const cachedChats = await getCurrentChats();
+              if (cachedChats.length > 0) {
+                console.log(`Using ${cachedChats.length} cached chats`);
+                socket.emit("chats", cachedChats);
+                socket.emit("syncProgress", { 
+                  status: "completed", 
+                  message: `✅ تم إرسال ${cachedChats.length} محادثة من الذاكرة المؤقتة`,
+                  progress: 100,
+                  total: cachedChats.length,
+                  current: cachedChats.length
+                });
+                syncInProgress = false;
+                return;
+              }
+            }
+            
+            if (attempt === maxRetries) {
+              socket.emit("syncProgress", { 
+                status: "error", 
+                message: `❌ خطأ في جلب المحادثات: ${error.message}`,
+                progress: 0,
+                total: 0,
+                current: 0
+              });
+              
+              if (isConvexReady()) {
+                await syncStatusDb.fail(currentAccountId, error.message).catch(() => {});
+              }
+              
+              syncInProgress = false;
+              return;
+            }
+            
+            // Wait before retry
+            await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
           }
-          
-          syncInProgress = false;
-          return;
         }
 
         if (syncCancelled) {
