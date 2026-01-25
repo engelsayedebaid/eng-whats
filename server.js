@@ -232,13 +232,19 @@ const cleanupOrphanedBrowser = async (accountId) => {
   const sessionPath = path.join(__dirname, '.wwebjs_auth', `session-${accountId}`);
   const lockFile = path.join(sessionPath, 'SingletonLock');
   
-  // Remove lock file if it exists
-  if (fs.existsSync(lockFile)) {
-    try {
-      fs.unlinkSync(lockFile);
-      console.log(`Removed lock file for ${accountId}`);
-    } catch (e) {
-      console.log(`Could not remove lock file: ${e.message}`);
+  console.log(`Cleaning up browser for account: ${accountId}`);
+  
+  // Remove lock files if they exist
+  const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+  for (const file of lockFiles) {
+    const filePath = path.join(sessionPath, file);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.rmSync(filePath, { recursive: true, force: true });
+        console.log(`Removed ${file} for ${accountId}`);
+      } catch (e) {
+        console.log(`Could not remove ${file}: ${e.message}`);
+      }
     }
   }
   
@@ -251,21 +257,47 @@ const cleanupOrphanedBrowser = async (accountId) => {
         if (!error) {
           console.log(`Terminated orphaned Chrome processes for ${accountId}`);
         }
-        setTimeout(resolve, 1000);
+        setTimeout(resolve, 1500);
       });
     } else {
-      // Linux/Mac - kill chromium/chrome processes for this session
-      exec(`pkill -f "chromium.*${accountId}" || pkill -f "chrome.*${accountId}" || true`, (error) => {
-        if (!error) {
-          console.log(`Terminated orphaned Chrome processes for ${accountId} (Linux)`);
-        }
-        // Also try to remove the SingletonLock directory content
-        exec(`rm -rf "${sessionPath}/SingletonLock" "${sessionPath}/SingletonCookie" "${sessionPath}/SingletonSocket" 2>/dev/null || true`, () => {
-          setTimeout(resolve, 1000);
-        });
+      // Linux/Mac - more aggressive cleanup
+      // Kill ANY chromium processes that might be orphaned
+      const commands = [
+        `pkill -9 -f "chromium.*${accountId}" 2>/dev/null || true`,
+        `pkill -9 -f "chrome.*${accountId}" 2>/dev/null || true`,
+        `pkill -9 -f "session-${accountId}" 2>/dev/null || true`,
+        `rm -rf "${sessionPath}/SingletonLock" "${sessionPath}/SingletonCookie" "${sessionPath}/SingletonSocket" 2>/dev/null || true`
+      ];
+      
+      exec(commands.join(' && '), () => {
+        console.log(`Cleanup completed for ${accountId} (Linux)`);
+        setTimeout(resolve, 1500);
       });
     }
   });
+};
+
+// Stop all running WhatsApp clients
+const stopAllClients = async () => {
+  console.log("Stopping all running WhatsApp clients...");
+  const promises = [];
+  
+  for (const [accountId, client] of whatsappClients.entries()) {
+    promises.push((async () => {
+      try {
+        console.log(`Stopping client for ${accountId}...`);
+        await client.destroy();
+      } catch (e) {
+        console.log(`Error stopping client ${accountId}: ${e.message}`);
+      }
+      await cleanupOrphanedBrowser(accountId);
+      whatsappClients.delete(accountId);
+      clientReadyStates.delete(accountId);
+    })());
+  }
+  
+  await Promise.all(promises);
+  console.log("All clients stopped");
 };
 
 // Store for WhatsApp clients - each account has its own client
@@ -664,7 +696,22 @@ app.prepare().then(() => {
       return;
     }
     
-    // If there's an existing client that's not ready, destroy it first
+    // Stop ALL other clients first (we can only run one browser at a time)
+    for (const [otherAccountId, otherClient] of whatsappClients.entries()) {
+      if (otherAccountId !== accountId) {
+        console.log(`Stopping other client: ${otherAccountId}`);
+        try {
+          await otherClient.destroy();
+        } catch (e) {
+          console.log(`Error stopping other client: ${e.message}`);
+        }
+        await cleanupOrphanedBrowser(otherAccountId);
+        whatsappClients.delete(otherAccountId);
+        clientReadyStates.delete(otherAccountId);
+      }
+    }
+    
+    // If there's an existing client for this account that's not ready, destroy it first
     if (client) {
       try {
         console.log(`Destroying existing non-ready client for ${accountId}...`);
@@ -672,9 +719,13 @@ app.prepare().then(() => {
       } catch (e) {
         console.log("Error destroying client (may already be closed):", e.message);
       }
+      await cleanupOrphanedBrowser(accountId);
       whatsappClients.delete(accountId);
       clientReadyStates.delete(accountId);
     }
+    
+    // Wait for all processes to fully terminate
+    await new Promise(resolve => setTimeout(resolve, 1500));
     
     // Create new client
     client = createWhatsAppClient(accountId);
@@ -711,9 +762,18 @@ app.prepare().then(() => {
         return initializeAccount(accountId, retryCount + 1);
       }
       
-      // If it's a Protocol error and we haven't retried yet, try again with fresh client
-      if (retryCount < 1 && (error.message.includes("Protocol error") || error.message.includes("Session closed") || error.message.includes("frame was detached"))) {
-        console.log("Puppeteer session error detected, retrying with fresh client...");
+      // If it's a Protocol/Navigation error and we haven't retried enough, try again
+      const isRecoverableError = 
+        error.message.includes("Protocol error") || 
+        error.message.includes("Session closed") || 
+        error.message.includes("frame was detached") ||
+        error.message.includes("Navigating frame") ||
+        error.message.includes("Navigation timeout") ||
+        error.message.includes("Execution context");
+        
+      if (retryCount < 2 && isRecoverableError) {
+        console.log(`Recoverable error detected: ${error.message.substring(0, 50)}...`);
+        console.log("Cleaning up and retrying...");
         
         // Clean up the failed client
         try {
@@ -724,8 +784,11 @@ app.prepare().then(() => {
         whatsappClients.delete(accountId);
         clientReadyStates.delete(accountId);
         
-        // Wait a bit before retry
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Clean up any orphaned browser
+        await cleanupOrphanedBrowser(accountId);
+        
+        // Wait a bit before retry (longer for each retry)
+        await new Promise(resolve => setTimeout(resolve, 3000 * (retryCount + 1)));
         
         // Retry
         return initializeAccount(accountId, retryCount + 1);
@@ -2165,22 +2228,13 @@ app.prepare().then(() => {
       currentAccountId = accountId;
       saveAccounts(accounts);
       
-      // IMPORTANT: Stop the previous account's browser to free resources
-      if (previousAccountId && previousAccountId !== accountId) {
-        const previousClient = whatsappClients.get(previousAccountId);
-        if (previousClient) {
-          console.log(`Stopping previous account browser: ${previousAccountId}`);
-          try {
-            await previousClient.destroy();
-            console.log(`Previous account ${previousAccountId} browser stopped`);
-          } catch (e) {
-            console.log(`Error stopping previous browser: ${e.message}`);
-            // Clean up orphaned browser
-            await cleanupOrphanedBrowser(previousAccountId);
-          }
-          whatsappClients.delete(previousAccountId);
-          clientReadyStates.delete(previousAccountId);
-        }
+      // IMPORTANT: Stop ALL running browsers to avoid conflicts
+      // On Railway, we can only run one browser at a time due to resource limits
+      if (whatsappClients.size > 0) {
+        console.log(`Stopping all running browsers before switching to ${accountId}...`);
+        await stopAllClients();
+        // Extra wait for browser processes to fully terminate
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
       
       // Check if client already exists for this account
