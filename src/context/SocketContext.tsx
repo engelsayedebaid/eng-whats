@@ -255,7 +255,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     });
 
     newSocket.on("chats", (data: Chat[]) => {
-      setChats(data);
+      // Ensure data is always an array
+      setChats(Array.isArray(data) ? data : []);
       // لا نوقف التحميل هنا - سيتم التحكم به من syncProgress
     });
 
@@ -318,6 +319,9 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Quick sync data - update timestamps and unread counts for ALL chats
     newSocket.on("quickSyncData", (updates: Array<{ id: string; name?: string; unreadCount: number; timestamp: number; lastMessageBody: string | null; lastMessageFromMe: boolean; lastMessageType?: string }>) => {
+      // Ensure updates is an array
+      if (!Array.isArray(updates)) return;
+      
       setChats(prev => {
         const updated = [...prev];
         const existingIds = new Set(prev.map(c => c.id));
@@ -498,7 +502,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Account management events
     newSocket.on("accounts", (data: Account[]) => {
-      setAccounts(data);
+      // Ensure data is always an array
+      setAccounts(Array.isArray(data) ? data : []);
     });
 
     newSocket.on("currentAccount", (accountId: string | null) => {
