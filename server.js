@@ -956,18 +956,32 @@ app.prepare().then(() => {
               }
             }
             
-            // Fetch media if available
-            if (msg.hasMedia) {
+            // Fetch media if available (with timeout and safety checks)
+            if (msg.hasMedia && isReady && whatsappClient?.pupPage) {
               try {
-                const media = await msg.downloadMedia();
+                // Add timeout to prevent hanging on Protocol errors
+                const media = await Promise.race([
+                  msg.downloadMedia(),
+                  new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Media download timeout')), 10000)
+                  )
+                ]);
                 if (media) {
                   messageData.mediaUrl = `data:${media.mimetype};base64,${media.data}`;
                   messageData.mimetype = media.mimetype;
                   messageData.filename = media.filename;
                 }
               } catch (e) {
-                console.error("Error downloading media:", e.message);
+                // Only log non-Protocol errors (Protocol errors are common when browser is busy)
+                if (!e.message.includes('Protocol error') && !e.message.includes('Target closed') && !e.message.includes('timeout')) {
+                  console.error("Error downloading media:", e.message);
+                }
+                // Mark that media exists but couldn't be downloaded
+                messageData.mediaError = true;
               }
+            } else if (msg.hasMedia) {
+              // Media exists but client not ready
+              messageData.mediaError = true;
             }
             
             // Get duration for audio/video
