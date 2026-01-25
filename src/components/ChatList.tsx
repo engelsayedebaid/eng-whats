@@ -160,7 +160,7 @@ export default function ChatList({
   onSelectChat: (chatId: string) => void;
   selectedChatId: string | null;
 }) {
-  const { chats, messages, isLoading, syncAllChats, fetchChats, isReady, syncProgress, searchMessages, clearSearch, searchState, privacyMode, setPrivacyMode } = useSocket();
+  const { chats, messages, isLoading, syncAllChats, quickSync, fetchChats, fetchProfilePics, isReady, syncProgress, searchMessages, clearSearch, searchState, privacyMode, setPrivacyMode } = useSocket();
   const [filter, setFilter] = useState<FilterType>("all");
   const [dateFilter, setDateFilter] = useState<DateFilterType>("all");
   const [typeFilter, setTypeFilter] = useState<TypeFilterType>("all");
@@ -220,6 +220,25 @@ export default function ChatList({
       fetchChats();
     }
   }, [isReady, chats.length, fetchChats]);
+
+  // Lazy load profile pictures for visible chats (first 20)
+  useEffect(() => {
+    if (isReady && chats.length > 0 && syncProgress.status !== "processing") {
+      // Get IDs of first 20 chats that don't have profile pics
+      const chatsNeedingPics = chats
+        .slice(0, 20)
+        .filter(chat => !chat.profilePic)
+        .map(chat => chat.id);
+      
+      if (chatsNeedingPics.length > 0) {
+        // Delay to not interfere with initial render
+        const timer = setTimeout(() => {
+          fetchProfilePics(chatsNeedingPics);
+        }, 1000);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [isReady, chats.length, syncProgress.status, fetchProfilePics]);
 
   // Date filter helpers
   const getDateRange = (filter: DateFilterType) => {
@@ -469,10 +488,10 @@ export default function ChatList({
               {privacyMode ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
             </button>
             <button
-              onClick={fetchChats}
+              onClick={quickSync}
               disabled={isLoading}
               className="p-2 bg-[#202c33] hover:bg-[#2a3942] rounded-lg text-gray-300 transition-colors disabled:opacity-50"
-              title="تحديث"
+              title="تحديث سريع"
             >
               <RefreshCw className={`w-5 h-5 ${isLoading ? 'animate-spin' : ''}`} />
             </button>
@@ -480,6 +499,7 @@ export default function ChatList({
               onClick={() => syncAllChats()}
               disabled={isLoading}
               className="flex items-center gap-2 px-3 py-2 bg-gradient-to-r from-green-600 to-emerald-500 hover:from-green-700 hover:to-emerald-600 rounded-lg text-white text-sm transition-all duration-200 disabled:opacity-50 shadow-lg shadow-green-500/25"
+              title="مزامنة كاملة"
             >
               {isLoading ? (
                 <Loader2 className="w-4 h-4 animate-spin" />

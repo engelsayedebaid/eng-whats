@@ -102,6 +102,8 @@ interface SocketContextType {
   fetchChats: () => void;
   fetchMessages: (chatId: string) => void;
   syncAllChats: (maxChats?: number) => void;
+  quickSync: () => void;
+  fetchProfilePics: (chatIds: string[]) => void;
   searchMessages: (query: string) => void;
   sendMessage: (chatId: string, message: string) => void;
   clearSearch: () => void;
@@ -314,27 +316,69 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       console.log(`Sync complete: ${data.success} success, ${data.errors} errors out of ${data.total}`);
     });
 
-    // Quick sync data - update timestamps and unread counts
-    newSocket.on("quickSyncData", (updates: Array<{ id: string; unreadCount: number; timestamp: number; lastMessageBody: string | null; lastMessageFromMe: boolean }>) => {
+    // Quick sync data - update timestamps and unread counts for ALL chats
+    newSocket.on("quickSyncData", (updates: Array<{ id: string; name?: string; unreadCount: number; timestamp: number; lastMessageBody: string | null; lastMessageFromMe: boolean; lastMessageType?: string }>) => {
       setChats(prev => {
         const updated = [...prev];
+        const existingIds = new Set(prev.map(c => c.id));
+        
         for (const update of updates) {
           const index = updated.findIndex(c => c.id === update.id);
           if (index >= 0) {
+            // Update existing chat
             updated[index] = {
               ...updated[index],
               unreadCount: update.unreadCount,
               timestamp: update.timestamp,
-              lastMessage: updated[index].lastMessage ? {
-                ...updated[index].lastMessage!,
-                body: update.lastMessageBody || updated[index].lastMessage!.body,
+              lastMessage: {
+                body: update.lastMessageBody || updated[index].lastMessage?.body || "",
                 fromMe: update.lastMessageFromMe,
-              } : null,
+                timestamp: update.timestamp,
+                type: update.lastMessageType || updated[index].lastMessage?.type || "chat",
+                typeLabel: updated[index].lastMessage?.typeLabel || "نص",
+                senderName: updated[index].lastMessage?.senderName || "",
+              },
             };
+          } else if (update.name) {
+            // Add new chat if not exists and has name
+            const phoneNumber = update.id.replace("@c.us", "").replace("@g.us", "");
+            updated.push({
+              id: update.id,
+              name: update.name,
+              phone: phoneNumber,
+              profilePic: null,
+              isGroup: update.id.includes("@g.us"),
+              participants: [],
+              participantCount: 0,
+              unreadCount: update.unreadCount,
+              lastMessage: update.lastMessageBody ? {
+                body: update.lastMessageBody,
+                fromMe: update.lastMessageFromMe,
+                timestamp: update.timestamp,
+                type: update.lastMessageType || "chat",
+                typeLabel: "نص",
+                senderName: "",
+              } : null,
+              timestamp: update.timestamp,
+            });
           }
         }
         return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       });
+    });
+    
+    // Handle profile picture updates
+    newSocket.on("profilePic", (data: { chatId: string; url: string | null }) => {
+      setChats(prev => prev.map(chat => 
+        chat.id === data.chatId ? { ...chat, profilePic: data.url } : chat
+      ));
+    });
+    
+    // Handle batch profile picture updates
+    newSocket.on("profilePics", (data: Record<string, string | null>) => {
+      setChats(prev => prev.map(chat => 
+        data[chat.id] !== undefined ? { ...chat, profilePic: data[chat.id] } : chat
+      ));
     });
 
     // Search progress handler
@@ -506,7 +550,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setIsLoading(true);
       setSyncProgress({
         status: "started",
-        message: "جاري بدء المزامنة...",
+        message: "جاري بدء المزامنة السريعة...",
         progress: 0,
         total: 0,
         current: 0,
@@ -514,6 +558,27 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       socket.emit("syncAllChats", { maxChats });
     }
   }, [socket, isReady]);
+
+  // Quick sync - fast update of timestamps and unread counts
+  const quickSync = useCallback(() => {
+    if (socket && isReady) {
+      socket.emit("quickSync");
+    }
+  }, [socket, isReady]);
+
+  // Fetch profile pictures for visible chats (lazy loading)
+  const fetchProfilePics = useCallback((chatIds: string[]) => {
+    if (socket && isReady && chatIds.length > 0) {
+      // Filter out chats that already have profile pics
+      const chatsNeedingPics = chatIds.filter(id => {
+        const chat = chats.find(c => c.id === id);
+        return chat && !chat.profilePic;
+      });
+      if (chatsNeedingPics.length > 0) {
+        socket.emit("getProfilePics", { chatIds: chatsNeedingPics });
+      }
+    }
+  }, [socket, isReady, chats]);
 
   const searchMessages = useCallback((query: string) => {
     if (socket && isReady && query.trim().length >= 2) {
@@ -617,6 +682,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         fetchChats,
         fetchMessages,
         syncAllChats,
+        quickSync,
+        fetchProfilePics,
         searchMessages,
         sendMessage,
         clearSearch,

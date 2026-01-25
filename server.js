@@ -226,6 +226,40 @@ const getChromiumPath = () => {
   return undefined; // Use bundled Chromium
 };
 
+// Cleanup function for orphaned browser sessions
+const cleanupOrphanedBrowser = async (accountId) => {
+  const sessionPath = path.join(__dirname, '.wwebjs_auth', `session-${accountId}`);
+  const lockFile = path.join(sessionPath, 'SingletonLock');
+  
+  // Remove lock file if it exists
+  if (fs.existsSync(lockFile)) {
+    try {
+      fs.unlinkSync(lockFile);
+      console.log(`Removed lock file for ${accountId}`);
+    } catch (e) {
+      console.log(`Could not remove lock file: ${e.message}`);
+    }
+  }
+  
+  // On Windows, try to kill Chrome processes using this session
+  if (process.platform === 'win32') {
+    const { exec } = require('child_process');
+    return new Promise((resolve) => {
+      // Find and kill Chrome processes with this user data dir
+      const userDataDir = sessionPath.replace(/\\/g, '\\\\');
+      exec(`wmic process where "commandline like '%${userDataDir}%' and name='chrome.exe'" call terminate`, (error) => {
+        if (!error) {
+          console.log(`Terminated orphaned Chrome processes for ${accountId}`);
+        }
+        // Wait a moment for process cleanup
+        setTimeout(resolve, 1000);
+      });
+    });
+  }
+  
+  return Promise.resolve();
+};
+
 // Store for WhatsApp clients - each account has its own client
 const whatsappClients = new Map();
 // Track ready state for each client
@@ -639,8 +673,27 @@ app.prepare().then(() => {
     } catch (error) {
       console.error(`Failed to initialize account ${accountId}:`, error.message);
       
+      // If browser is already running, clean up orphaned processes and retry
+      if (retryCount < 2 && error.message.includes("browser is already running")) {
+        console.log("Browser already running error detected, cleaning up orphaned processes...");
+        
+        // Clean up the failed client from our maps
+        whatsappClients.delete(accountId);
+        clientReadyStates.delete(accountId);
+        
+        // Clean up orphaned browser processes
+        await cleanupOrphanedBrowser(accountId);
+        
+        // Wait for cleanup to complete
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Retry with fresh client
+        console.log("Retrying initialization after cleanup...");
+        return initializeAccount(accountId, retryCount + 1);
+      }
+      
       // If it's a Protocol error and we haven't retried yet, try again with fresh client
-      if (retryCount < 1 && (error.message.includes("Protocol error") || error.message.includes("Session closed"))) {
+      if (retryCount < 1 && (error.message.includes("Protocol error") || error.message.includes("Session closed") || error.message.includes("frame was detached"))) {
         console.log("Puppeteer session error detected, retrying with fresh client...");
         
         // Clean up the failed client
@@ -1200,97 +1253,132 @@ app.prepare().then(() => {
     let syncInProgress = false;
     let syncCancelled = false;
     
-    // Process a single chat and return formatted data
-    const processChat = async (chat, typeLabels) => {
-      try {
-        const phoneNumber = chat.id._serialized.split("@")[0];
-        
-        // Get profile picture with short timeout (non-blocking)
-        let profilePic = null;
+    // Profile picture cache to avoid repeated fetching
+    const profilePicCache = new Map(); // chatId -> { url, fetchedAt }
+    const PROFILE_PIC_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+    
+    // Type labels for messages
+    const typeLabels = {
+      chat: "نص",
+      image: "صورة 📷",
+      video: "فيديو 🎥",
+      audio: "صوت 🎵",
+      ptt: "رسالة صوتية 🎤",
+      document: "مستند 📄",
+      sticker: "ملصق",
+      location: "موقع 📍",
+      contact: "جهة اتصال 👤",
+      poll_creation: "استطلاع 📊",
+    };
+    
+    // Fast chat processing - without profile pics (for speed)
+    const processChatFast = (chat) => {
+      const phoneNumber = chat.id._serialized.split("@")[0];
+      
+      // Get participants for groups (sync, from existing data)
+      let participants = [];
+      if (chat.isGroup && chat.participants) {
         try {
-          const contact = await Promise.race([
-            chat.getContact(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
-          ]);
-          profilePic = await Promise.race([
-            contact.getProfilePicUrl(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
-          ]);
-        } catch (e) {
-          // Skip profile pic on error or timeout - this is optional
-        }
-        
-        // Get participants for groups (non-blocking)
-        let participants = [];
-        if (chat.isGroup && chat.participants) {
-          try {
-            participants = chat.participants.map(p => ({
-              id: p.id._serialized,
-              name: p.id.user,
-              isAdmin: p.isAdmin || false,
-              isSuperAdmin: p.isSuperAdmin || false,
-            }));
-          } catch (e) {
-            // Skip participants on error
+          participants = chat.participants.map(p => ({
+            id: p.id._serialized,
+            name: p.id.user,
+            isAdmin: p.isAdmin || false,
+            isSuperAdmin: p.isSuperAdmin || false,
+          }));
+        } catch (e) {}
+      }
+      
+      // Get last message info
+      let lastMessageData = null;
+      if (chat.lastMessage) {
+        try {
+          const msg = chat.lastMessage;
+          let senderName = "أنا";
+          
+          if (!msg.fromMe && chat.isGroup) {
+            const senderId = msg.author || msg.from;
+            senderName = senderId ? senderId.split("@")[0] : "مجهول";
+          } else if (!msg.fromMe) {
+            senderName = chat.name || phoneNumber;
           }
+          
+          lastMessageData = {
+            body: msg.body || typeLabels[msg.type] || "",
+            fromMe: msg.fromMe || false,
+            timestamp: msg.timestamp || Date.now() / 1000,
+            type: msg.type || "chat",
+            typeLabel: typeLabels[msg.type] || "نص",
+            senderName: senderName,
+          };
+        } catch (e) {}
+      }
+      
+      // Check cache for profile pic
+      let profilePic = null;
+      const cached = profilePicCache.get(chat.id._serialized);
+      if (cached && (Date.now() - cached.fetchedAt) < PROFILE_PIC_CACHE_TTL) {
+        profilePic = cached.url;
+      }
+      
+      return {
+        id: chat.id._serialized,
+        name: chat.name || chat.id.user || phoneNumber || "Unknown",
+        phone: phoneNumber,
+        profilePic: profilePic,
+        isGroup: chat.isGroup || false,
+        participants: participants,
+        participantCount: chat.isGroup ? (participants.length || chat.groupMetadata?.participants?.length || 0) : 0,
+        unreadCount: chat.unreadCount || 0,
+        lastMessage: lastMessageData,
+        timestamp: chat.timestamp || Date.now() / 1000,
+      };
+    };
+    
+    // Fetch profile picture lazily (called on demand)
+    const fetchProfilePic = async (chatId) => {
+      try {
+        // Check cache first
+        const cached = profilePicCache.get(chatId);
+        if (cached && (Date.now() - cached.fetchedAt) < PROFILE_PIC_CACHE_TTL) {
+          return cached.url;
         }
         
-        // Get last message info
-        let lastMessageData = null;
-        if (chat.lastMessage) {
-          try {
-            const msg = chat.lastMessage;
-            let senderName = "أنا";
-            
-            if (!msg.fromMe && chat.isGroup) {
-              const senderId = msg.author || msg.from;
-              senderName = senderId ? senderId.split("@")[0] : "مجهول";
-            } else if (!msg.fromMe) {
-              senderName = chat.name || phoneNumber;
-            }
-            
-            lastMessageData = {
-              body: msg.body || typeLabels[msg.type] || "",
-              fromMe: msg.fromMe || false,
-              timestamp: msg.timestamp || Date.now() / 1000,
-              type: msg.type || "chat",
-              typeLabel: typeLabels[msg.type] || "نص",
-              senderName: senderName,
-            };
-          } catch (e) {
-            // Skip last message on error
-          }
-        }
+        const chat = await whatsappClient.getChatById(chatId);
+        const contact = await Promise.race([
+          chat.getContact(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
+        ]);
+        const profilePic = await Promise.race([
+          contact.getProfilePicUrl(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000))
+        ]);
         
-        return {
-          id: chat.id._serialized,
-          name: chat.name || chat.id.user || phoneNumber || "Unknown",
-          phone: phoneNumber,
-          profilePic: profilePic,
-          isGroup: chat.isGroup || false,
-          participants: participants,
-          participantCount: participants.length,
-          unreadCount: chat.unreadCount || 0,
-          lastMessage: lastMessageData,
-          timestamp: chat.timestamp || Date.now() / 1000,
-        };
+        profilePicCache.set(chatId, { url: profilePic || null, fetchedAt: Date.now() });
+        return profilePic;
       } catch (e) {
-        // Return minimal data on error
-        const phoneNumber = chat.id._serialized.split("@")[0];
-        return {
-          id: chat.id._serialized,
-          name: chat.name || chat.id.user || phoneNumber || "Unknown",
-          phone: phoneNumber,
-          profilePic: null,
-          isGroup: chat.isGroup || false,
-          participants: [],
-          participantCount: 0,
-          unreadCount: 0,
-          lastMessage: null,
-          timestamp: chat.timestamp || Date.now() / 1000,
-        };
+        profilePicCache.set(chatId, { url: null, fetchedAt: Date.now() });
+        return null;
       }
     };
+    
+    // Handle profile picture requests from client
+    socket.on("getProfilePic", async ({ chatId }) => {
+      const profilePic = await fetchProfilePic(chatId);
+      socket.emit("profilePic", { chatId, url: profilePic });
+    });
+    
+    // Batch fetch profile pics for visible chats
+    socket.on("getProfilePics", async ({ chatIds }) => {
+      const results = {};
+      const batchSize = 5;
+      for (let i = 0; i < chatIds.length; i += batchSize) {
+        const batch = chatIds.slice(i, i + batchSize);
+        await Promise.all(batch.map(async (chatId) => {
+          results[chatId] = await fetchProfilePic(chatId);
+        }));
+      }
+      socket.emit("profilePics", results);
+    });
 
     // Cancel ongoing sync
     socket.on("cancelSync", () => {
@@ -1339,26 +1427,13 @@ app.prepare().then(() => {
       syncCancelled = false;
 
       try {
-        console.log("Starting enhanced streaming sync...");
-        
-        // Type labels for messages
-        const typeLabels = {
-          chat: "نص",
-          image: "صورة 📷",
-          video: "فيديو 🎥",
-          audio: "صوت 🎵",
-          ptt: "رسالة صوتية 🎤",
-          document: "مستند 📄",
-          sticker: "ملصق",
-          location: "موقع 📍",
-          contact: "جهة اتصال 👤",
-          poll_creation: "استطلاع 📊",
-        };
+        console.log("Starting FAST streaming sync (no profile pics)...");
+        const syncStartTime = Date.now();
 
         // Emit sync started
         socket.emit("syncProgress", { 
           status: "started", 
-          message: "🔄 بدء المزامنة المحسّنة...",
+          message: "🚀 بدء المزامنة السريعة...",
           progress: 1,
           total: 0,
           current: 0
@@ -1393,7 +1468,7 @@ app.prepare().then(() => {
         let allChats;
         try {
           allChats = await whatsappClient.getChats();
-          console.log(`Found ${allChats.length} chats`);
+          console.log(`Found ${allChats.length} chats in ${Date.now() - syncStartTime}ms`);
         } catch (error) {
           console.error("Error fetching chats:", error);
           socket.emit("syncProgress", { 
@@ -1404,7 +1479,6 @@ app.prepare().then(() => {
             current: 0
           });
           
-          // Log error to Convex
           if (isConvexReady()) {
             await syncStatusDb.fail(currentAccountId, error.message).catch(() => {});
           }
@@ -1440,10 +1514,10 @@ app.prepare().then(() => {
           await syncStatusDb.startSync(currentAccountId, totalChats).catch(() => {});
         }
 
-        console.log(`Processing ${totalChats} chats with enhanced streaming...`);
+        console.log(`Processing ${totalChats} chats with FAST sync...`);
         socket.emit("syncProgress", { 
           status: "processing", 
-          message: `🔍 تم العثور على ${totalChats} محادثة، جاري المعالجة...`,
+          message: `⚡ معالجة ${totalChats} محادثة بسرعة فائقة...`,
           progress: 5,
           total: totalChats,
           current: 0
@@ -1461,25 +1535,56 @@ app.prepare().then(() => {
         let errorCount = 0;
         let unchangedCount = 0;
         
-        // Batch size for Convex updates
+        // Batch processing for speed - process multiple chats in parallel
+        const PARALLEL_BATCH_SIZE = 50; // Process 50 chats at a time
         const CONVEX_BATCH_SIZE = 20;
         let convexBatch = [];
 
-        // Process chats one by one with streaming
-        for (let i = 0; i < chatsToProcess.length; i++) {
-          // Check for cancellation
+        // Process chats in parallel batches for MASSIVE speed improvement
+        for (let batchStart = 0; batchStart < chatsToProcess.length; batchStart += PARALLEL_BATCH_SIZE) {
           if (syncCancelled) {
             console.log("Sync cancelled during processing");
             syncInProgress = false;
             return;
           }
 
-          const chat = chatsToProcess[i];
-          const chatName = chat.name || chat.id.user || chat.id._serialized.split("@")[0] || "Unknown";
+          const batchEnd = Math.min(batchStart + PARALLEL_BATCH_SIZE, chatsToProcess.length);
+          const batch = chatsToProcess.slice(batchStart, batchEnd);
 
-          try {
-            // Process single chat
-            const processedChat = await processChat(chat, typeLabels);
+          // Process entire batch in parallel using FAST sync (no async profile pic fetching)
+          const batchResults = batch.map((chat, idx) => {
+            try {
+              const processedChat = processChatFast(chat);
+              return { success: true, chat: processedChat, index: batchStart + idx };
+            } catch (e) {
+              const phoneNumber = chat.id._serialized.split("@")[0];
+              return {
+                success: false,
+                chat: {
+                  id: chat.id._serialized,
+                  name: chat.name || phoneNumber || "Unknown",
+                  phone: phoneNumber,
+                  profilePic: null,
+                  isGroup: chat.isGroup || false,
+                  participants: [],
+                  participantCount: 0,
+                  unreadCount: 0,
+                  lastMessage: null,
+                  timestamp: chat.timestamp || Date.now() / 1000,
+                },
+                index: batchStart + idx
+              };
+            }
+          });
+
+          // Process results and emit to client
+          for (const result of batchResults) {
+            const processedChat = result.chat;
+            const i = result.index;
+            
+            if (!result.success) {
+              errorCount++;
+            }
             
             // Check if chat changed (for incremental sync)
             if (incrementalOnly && existingChatsMap.has(processedChat.id)) {
@@ -1488,46 +1593,15 @@ app.prepare().then(() => {
                   existing.unreadCount === processedChat.unreadCount) {
                 unchangedCount++;
                 processedChats.push(processedChat);
-                continue; // Skip unchanged chats
+                continue;
               }
             }
             
             processedChats.push(processedChat);
-            successCount++;
+            if (result.success) successCount++;
             
-            // Add to Convex batch
             convexBatch.push(processedChat);
 
-            // Stream this chat immediately to the client
-            socket.emit("syncChat", {
-              chat: processedChat,
-              index: i,
-              total: totalChats
-            });
-
-            // Calculate progress (5% to 98%)
-            const progress = Math.round(5 + ((i + 1) / totalChats) * 93);
-            
-            // Emit progress with current chat name
-            socket.emit("syncProgress", { 
-              status: "processing", 
-              message: `📱 مزامنة: ${chatName}`,
-              progress: progress,
-              total: totalChats,
-              current: i + 1,
-              chatName: chatName
-            });
-            
-            // Update Convex progress every 10 chats
-            if ((i + 1) % 10 === 0 && isConvexReady()) {
-              syncStatusDb.updateProgress(
-                currentAccountId, 
-                i + 1, 
-                totalChats, 
-                chatName
-              ).catch(() => {});
-            }
-            
             // Batch save to Convex
             if (convexBatch.length >= CONVEX_BATCH_SIZE) {
               if (isConvexReady()) {
@@ -1537,43 +1611,27 @@ app.prepare().then(() => {
               }
               convexBatch = [];
             }
-
-            // Log every 10 chats for performance
-            if ((i + 1) % 10 === 0 || i === 0) {
-              console.log(`Synced ${i + 1}/${totalChats} - Current: ${chatName}`);
-            }
-
-          } catch (error) {
-            console.error(`Error processing chat ${i}:`, error.message);
-            errorCount++;
-            
-            // Still create minimal data on error
-            const phoneNumber = chat.id._serialized.split("@")[0];
-            const minimalChat = {
-              id: chat.id._serialized,
-              name: chatName,
-              phone: phoneNumber,
-              profilePic: null,
-              isGroup: chat.isGroup || false,
-              participants: [],
-              participantCount: 0,
-              unreadCount: 0,
-              lastMessage: null,
-              timestamp: chat.timestamp || Date.now() / 1000,
-            };
-            processedChats.push(minimalChat);
-            
-            socket.emit("syncChat", {
-              chat: minimalChat,
-              index: i,
-              total: totalChats
-            });
           }
 
-          // Yield to event loop every 5 chats to allow receiving new messages
-          if ((i + 1) % 5 === 0) {
-            await new Promise(resolve => setImmediate(resolve));
+          // Emit progress after each batch
+          const progress = Math.round(5 + (batchEnd / totalChats) * 93);
+          socket.emit("syncProgress", { 
+            status: "processing", 
+            message: `⚡ تم معالجة ${batchEnd} من ${totalChats} محادثة`,
+            progress: progress,
+            total: totalChats,
+            current: batchEnd
+          });
+          
+          // Update Convex progress
+          if (isConvexReady()) {
+            syncStatusDb.updateProgress(currentAccountId, batchEnd, totalChats, `Batch ${Math.ceil(batchEnd/PARALLEL_BATCH_SIZE)}`).catch(() => {});
           }
+
+          console.log(`Fast synced batch: ${batchEnd}/${totalChats} (${Date.now() - syncStartTime}ms elapsed)`);
+          
+          // Yield to event loop between batches
+          await new Promise(resolve => setImmediate(resolve));
         }
 
         // Save remaining batch to Convex
@@ -1586,23 +1644,26 @@ app.prepare().then(() => {
         // Update account chats
         setCurrentChats(processedChats);
 
+        // Calculate sync time
+        const syncDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
+
         // Emit completion
         let successMessage;
         if (incrementalOnly && unchangedCount > 0) {
-          successMessage = `✅ تم تحديث ${successCount} محادثة (${unchangedCount} بدون تغيير)`;
+          successMessage = `✅ تم تحديث ${successCount} محادثة (${unchangedCount} بدون تغيير) في ${syncDuration} ثانية`;
         } else if (errorCount > 0) {
-          successMessage = `✅ تم مزامنة ${successCount} محادثة (${errorCount} أخطاء)`;
+          successMessage = `✅ تم مزامنة ${successCount} محادثة (${errorCount} أخطاء) في ${syncDuration} ثانية`;
         } else {
-          successMessage = `✅ تم مزامنة ${successCount} محادثة بنجاح!`;
+          successMessage = `✅ تم مزامنة ${successCount} محادثة في ${syncDuration} ثانية فقط!`;
         }
 
-        console.log(successMessage);
+        console.log(`FAST SYNC COMPLETE: ${successCount} chats in ${syncDuration}s`);
         
         // Update Convex completion status
         if (isConvexReady()) {
           await syncStatusDb.complete(currentAccountId, totalChats).catch(() => {});
           eventsDb.log(currentAccountId, "sync_complete", 
-            `Synced ${successCount} chats, ${errorCount} errors`
+            `Fast synced ${successCount} chats in ${syncDuration}s`
           ).catch(() => {});
         }
         
@@ -1614,7 +1675,8 @@ app.prepare().then(() => {
           current: totalChats,
           successCount: successCount,
           errorCount: errorCount,
-          unchangedCount: unchangedCount
+          unchangedCount: unchangedCount,
+          duration: syncDuration
         });
 
         // Broadcast to all clients that sync is complete
@@ -1622,7 +1684,8 @@ app.prepare().then(() => {
           total: processedChats.length,
           success: successCount,
           errors: errorCount,
-          unchanged: unchangedCount
+          unchanged: unchangedCount,
+          duration: syncDuration
         });
 
         // Send complete chats array as final confirmation
@@ -1669,19 +1732,34 @@ app.prepare().then(() => {
 
         const allChats = await whatsappClient.getChats();
         
-        // Just update timestamps and unread counts without full processing
-        const quickUpdates = allChats.slice(0, 100).map(chat => ({
-          id: chat.id._serialized,
-          unreadCount: chat.unreadCount || 0,
-          timestamp: chat.timestamp || Date.now() / 1000,
-          lastMessageBody: chat.lastMessage?.body || null,
-          lastMessageFromMe: chat.lastMessage?.fromMe || false,
-        }));
+        // Update ALL chats timestamps and unread counts using fast processing
+        const quickUpdates = allChats.map(chat => {
+          const phoneNumber = chat.id._serialized.split("@")[0];
+          let lastMessageBody = null;
+          let lastMessageFromMe = false;
+          let lastMessageType = "chat";
+          
+          if (chat.lastMessage) {
+            lastMessageBody = chat.lastMessage.body || typeLabels[chat.lastMessage.type] || "";
+            lastMessageFromMe = chat.lastMessage.fromMe || false;
+            lastMessageType = chat.lastMessage.type || "chat";
+          }
+          
+          return {
+            id: chat.id._serialized,
+            name: chat.name || chat.id.user || phoneNumber || "Unknown",
+            unreadCount: chat.unreadCount || 0,
+            timestamp: chat.timestamp || Date.now() / 1000,
+            lastMessageBody: lastMessageBody,
+            lastMessageFromMe: lastMessageFromMe,
+            lastMessageType: lastMessageType,
+          };
+        });
 
         socket.emit("quickSyncData", quickUpdates);
         socket.emit("syncProgress", {
           status: "completed",
-          message: "✅ تم التحديث السريع",
+          message: `✅ تم تحديث ${quickUpdates.length} محادثة بسرعة`,
           progress: 100,
           total: quickUpdates.length,
           current: quickUpdates.length
@@ -1919,6 +1997,8 @@ app.prepare().then(() => {
             await existingClient.destroy();
           } catch (e) {
             console.log("Error destroying client (may already be closed):", e.message);
+            // Clean up orphaned browser processes if destroy failed
+            await cleanupOrphanedBrowser(accountId);
           }
           whatsappClients.delete(accountId);
           clientReadyStates.delete(accountId);
@@ -1934,6 +2014,26 @@ app.prepare().then(() => {
           await client.initialize();
         } catch (error) {
           console.error(`Failed to initialize account ${accountId}:`, error.message);
+          
+          // If browser is already running, clean up and retry once
+          if (error.message.includes("browser is already running")) {
+            console.log("Browser conflict detected, cleaning up and retrying...");
+            whatsappClients.delete(accountId);
+            clientReadyStates.delete(accountId);
+            await cleanupOrphanedBrowser(accountId);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            const retryClient = createWhatsAppClient(accountId);
+            whatsappClients.set(accountId, retryClient);
+            setupClientEvents(retryClient, accountId);
+            whatsappClient = retryClient;
+            
+            try {
+              await retryClient.initialize();
+            } catch (retryError) {
+              console.error(`Retry also failed: ${retryError.message}`);
+            }
+          }
         }
         return;
       }
@@ -2016,6 +2116,8 @@ app.prepare().then(() => {
           await client.destroy();
         } catch (e) {
           console.log("Error destroying client:", e.message);
+          // Clean up orphaned browser processes if destroy failed
+          await cleanupOrphanedBrowser(accountId);
         }
         whatsappClients.delete(accountId);
         clientReadyStates.delete(accountId);
@@ -2034,6 +2136,26 @@ app.prepare().then(() => {
         await newClient.initialize();
       } catch (error) {
         console.error(`Failed to initialize account ${accountId}:`, error.message);
+        
+        // If browser is already running, clean up and retry once
+        if (error.message.includes("browser is already running")) {
+          console.log("Browser conflict detected, cleaning up and retrying...");
+          whatsappClients.delete(accountId);
+          clientReadyStates.delete(accountId);
+          await cleanupOrphanedBrowser(accountId);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          const retryClient = createWhatsAppClient(accountId);
+          whatsappClients.set(accountId, retryClient);
+          setupClientEvents(retryClient, accountId);
+          whatsappClient = retryClient;
+          
+          try {
+            await retryClient.initialize();
+          } catch (retryError) {
+            console.error(`Retry also failed: ${retryError.message}`);
+          }
+        }
       }
     });
 
@@ -2082,6 +2204,8 @@ app.prepare().then(() => {
             await client.destroy();
           } catch (e) {
             console.error(`Error destroying client ${accountId}:`, e.message);
+            // Clean up orphaned browser for this account
+            await cleanupOrphanedBrowser(accountId);
           }
         }
         
@@ -2089,13 +2213,40 @@ app.prepare().then(() => {
         whatsappClients.clear();
         clientReadyStates.clear();
         
+        // On Windows, kill ALL Chrome processes that might be holding locks
+        if (process.platform === 'win32') {
+          const { exec } = require('child_process');
+          await new Promise((resolve) => {
+            const wwebjsPath = path.join(__dirname, '.wwebjs_auth').replace(/\\/g, '\\\\');
+            exec(`wmic process where "commandline like '%${wwebjsPath}%' and name='chrome.exe'" call terminate`, (error) => {
+              if (!error) {
+                console.log("Terminated all WhatsApp Chrome processes");
+              }
+              setTimeout(resolve, 2000); // Wait for processes to fully terminate
+            });
+          });
+        }
+        
         // Clear session directories
         const authPath = path.join(__dirname, ".wwebjs_auth");
         const cachePath = path.join(__dirname, ".wwebjs_cache");
         
         if (fs.existsSync(authPath)) {
           console.log("Removing auth directory...");
-          fs.rmSync(authPath, { recursive: true, force: true });
+          try {
+            fs.rmSync(authPath, { recursive: true, force: true });
+          } catch (rmError) {
+            console.log("Could not remove auth directory, trying alternative method...");
+            // On Windows, use rd command which can sometimes work when fs.rmSync fails
+            if (process.platform === 'win32') {
+              const { execSync } = require('child_process');
+              try {
+                execSync(`rd /s /q "${authPath}"`, { stdio: 'ignore' });
+              } catch (e) {
+                console.log("Alternative removal also failed, directory may be in use");
+              }
+            }
+          }
         }
         
         if (fs.existsSync(cachePath)) {
