@@ -569,16 +569,10 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   // Fetch profile pictures for visible chats (lazy loading)
   const fetchProfilePics = useCallback((chatIds: string[]) => {
     if (socket && isReady && chatIds.length > 0) {
-      // Filter out chats that already have profile pics
-      const chatsNeedingPics = chatIds.filter(id => {
-        const chat = chats.find(c => c.id === id);
-        return chat && !chat.profilePic;
-      });
-      if (chatsNeedingPics.length > 0) {
-        socket.emit("getProfilePics", { chatIds: chatsNeedingPics });
-      }
+      // Just emit the request - server will handle filtering
+      socket.emit("getProfilePics", { chatIds });
     }
-  }, [socket, isReady, chats]);
+  }, [socket, isReady]);
 
   const searchMessages = useCallback((query: string) => {
     if (socket && isReady && query.trim().length >= 2) {

@@ -221,9 +221,9 @@ export default function ChatList({
     }
   }, [isReady, chats.length, fetchChats]);
 
-  // Lazy load profile pictures for visible chats (first 20)
+  // Lazy load profile pictures for visible chats (first 20) - runs once after sync completes
   useEffect(() => {
-    if (isReady && chats.length > 0 && syncProgress.status !== "processing") {
+    if (isReady && chats.length > 0 && syncProgress.status === "idle") {
       // Get IDs of first 20 chats that don't have profile pics
       const chatsNeedingPics = chats
         .slice(0, 20)
@@ -234,11 +234,12 @@ export default function ChatList({
         // Delay to not interfere with initial render
         const timer = setTimeout(() => {
           fetchProfilePics(chatsNeedingPics);
-        }, 1000);
+        }, 2000);
         return () => clearTimeout(timer);
       }
     }
-  }, [isReady, chats.length, syncProgress.status, fetchProfilePics]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, syncProgress.status]);
 
   // Date filter helpers
   const getDateRange = (filter: DateFilterType) => {

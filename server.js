@@ -228,6 +228,7 @@ const getChromiumPath = () => {
 
 // Cleanup function for orphaned browser sessions
 const cleanupOrphanedBrowser = async (accountId) => {
+  const { exec } = require('child_process');
   const sessionPath = path.join(__dirname, '.wwebjs_auth', `session-${accountId}`);
   const lockFile = path.join(sessionPath, 'SingletonLock');
   
@@ -241,23 +242,30 @@ const cleanupOrphanedBrowser = async (accountId) => {
     }
   }
   
-  // On Windows, try to kill Chrome processes using this session
-  if (process.platform === 'win32') {
-    const { exec } = require('child_process');
-    return new Promise((resolve) => {
-      // Find and kill Chrome processes with this user data dir
+  // Kill Chrome processes using this session
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      // Windows
       const userDataDir = sessionPath.replace(/\\/g, '\\\\');
       exec(`wmic process where "commandline like '%${userDataDir}%' and name='chrome.exe'" call terminate`, (error) => {
         if (!error) {
           console.log(`Terminated orphaned Chrome processes for ${accountId}`);
         }
-        // Wait a moment for process cleanup
         setTimeout(resolve, 1000);
       });
-    });
-  }
-  
-  return Promise.resolve();
+    } else {
+      // Linux/Mac - kill chromium/chrome processes for this session
+      exec(`pkill -f "chromium.*${accountId}" || pkill -f "chrome.*${accountId}" || true`, (error) => {
+        if (!error) {
+          console.log(`Terminated orphaned Chrome processes for ${accountId} (Linux)`);
+        }
+        // Also try to remove the SingletonLock directory content
+        exec(`rm -rf "${sessionPath}/SingletonLock" "${sessionPath}/SingletonCookie" "${sessionPath}/SingletonSocket" 2>/dev/null || true`, () => {
+          setTimeout(resolve, 1000);
+        });
+      });
+    }
+  });
 };
 
 // Store for WhatsApp clients - each account has its own client
@@ -2121,8 +2129,25 @@ app.prepare().then(() => {
       currentAccountId = accountId;
       saveAccounts(accounts);
       
+      // IMPORTANT: Stop the previous account's browser to free resources
+      if (previousAccountId && previousAccountId !== accountId) {
+        const previousClient = whatsappClients.get(previousAccountId);
+        if (previousClient) {
+          console.log(`Stopping previous account browser: ${previousAccountId}`);
+          try {
+            await previousClient.destroy();
+            console.log(`Previous account ${previousAccountId} browser stopped`);
+          } catch (e) {
+            console.log(`Error stopping previous browser: ${e.message}`);
+            // Clean up orphaned browser
+            await cleanupOrphanedBrowser(previousAccountId);
+          }
+          whatsappClients.delete(previousAccountId);
+          clientReadyStates.delete(previousAccountId);
+        }
+      }
+      
       // Check if client already exists for this account
-
       let client = whatsappClients.get(accountId);
       const isClientReady = clientReadyStates.get(accountId);
       
