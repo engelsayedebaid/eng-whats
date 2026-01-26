@@ -325,8 +325,7 @@ const createWhatsAppClient = (accountId) => {
         "--disable-web-security",
         "--disable-features=IsolateOrigins,site-per-process",
         "--disable-blink-features=AutomationControlled",
-        // Memory optimization flags
-        "--single-process",
+        // Memory optimization flags - NOTE: --single-process removed to prevent frame detachment
         "--disable-extensions",
         "--disable-plugins",
         "--disable-translate",
@@ -343,9 +342,12 @@ const createWhatsAppClient = (accountId) => {
         "--disable-domain-reliability",
         "--disable-print-preview",
         "--disable-speech-api",
-        "--no-zygote",
         "--memory-pressure-off",
-        "--js-flags=--max-old-space-size=256",
+        "--js-flags=--max-old-space-size=512",
+        // Stability flags for containerized environments
+        "--disable-software-rasterizer",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
       ],
       timeout: 0,
       ignoreHTTPSErrors: true,
@@ -634,16 +636,60 @@ app.prepare().then(() => {
       }
     });
 
+    // Track if we're currently reinitializing to prevent loops
+    let isReinitializing = false;
+    
     client.on("error", (error) => {
       console.error(`WhatsApp client error for account ${accountId}:`, error);
-      if (error.message && error.message.includes('Target closed')) {
-        console.log('Browser target closed, attempting to reinitialize...');
-        setTimeout(() => {
-          if (currentAccountId === accountId && !isReady) {
-            console.log('Reinitializing WhatsApp client...');
-            client.initialize().catch(err => {
-              console.error('Failed to reinitialize:', err.message);
-            });
+      
+      // Check for detached frame or closed browser errors
+      const isDetachedError = error.message && (
+        error.message.includes('Target closed') ||
+        error.message.includes('detached Frame') ||
+        error.message.includes('Session closed') ||
+        error.message.includes('Protocol error') ||
+        error.message.includes('Execution context was destroyed')
+      );
+      
+      if (isDetachedError && !isReinitializing) {
+        console.log('Browser page detached/closed, will reinitialize after cleanup...');
+        isReinitializing = true;
+        
+        // Mark client as not ready immediately
+        clientReadyStates.set(accountId, false);
+        if (currentAccountId === accountId) {
+          isReady = false;
+          io.emit("status", { isReady: false, reason: "reconnecting" });
+        }
+        
+        setTimeout(async () => {
+          if (currentAccountId === accountId) {
+            console.log('Reinitializing WhatsApp client after detachment...');
+            try {
+              // Destroy the old client first
+              try {
+                await client.destroy();
+              } catch (e) {
+                console.log('Client already destroyed:', e.message);
+              }
+              
+              // Clean up and reinitialize
+              whatsappClients.delete(accountId);
+              clientReadyStates.delete(accountId);
+              await cleanupOrphanedBrowser(accountId);
+              
+              // Wait before reinitializing
+              await new Promise(r => setTimeout(r, 3000));
+              
+              // Reinitialize the account
+              await initializeAccount(accountId, 0);
+            } catch (err) {
+              console.error('Failed to reinitialize after detachment:', err.message);
+            } finally {
+              isReinitializing = false;
+            }
+          } else {
+            isReinitializing = false;
           }
         }, 5000);
       }
@@ -812,12 +858,34 @@ app.prepare().then(() => {
     // Track getChats in progress to prevent multiple calls
     let isGettingChats = false;
     let lastGetChatsTime = 0;
-    const GET_CHATS_THROTTLE = 10000; // 10 seconds between getChats calls
+    let consecutiveDetachErrors = 0;
+    const GET_CHATS_THROTTLE = 30000; // 30 seconds between getChats calls (increased to reduce load)
+
+    // Helper function to check if page is still healthy
+    const isPageHealthy = async () => {
+      try {
+        if (!whatsappClient || !whatsappClient.pupPage) {
+          return false;
+        }
+        // Try a simple page operation to verify connection
+        await whatsappClient.pupPage.evaluate(() => true);
+        return true;
+      } catch (e) {
+        console.log("Page health check failed:", e.message);
+        return false;
+      }
+    };
 
     // Request to fetch chats
     socket.on("getChats", async () => {
       if (!isReady) {
-        socket.emit("chatsError", { message: "WhatsApp not ready" });
+        // Still send cached chats if available
+        const cached = await getCurrentChats();
+        if (cached.length > 0) {
+          socket.emit("chats", cached);
+        } else {
+          socket.emit("chatsError", { message: "WhatsApp not ready" });
+        }
         return;
       }
 
@@ -825,7 +893,7 @@ app.prepare().then(() => {
       const now = Date.now();
       if (now - lastGetChatsTime < GET_CHATS_THROTTLE) {
         console.log("getChats throttled - sending cached data");
-        const cachedChats = getCurrentChats();
+        const cachedChats = await getCurrentChats();
         if (cachedChats.length > 0) {
           socket.emit("chats", cachedChats);
         }
@@ -835,7 +903,7 @@ app.prepare().then(() => {
       // Check if already in progress
       if (isGettingChats) {
         console.log("getChats already in progress - sending cached data");
-        const cachedChats = getCurrentChats();
+        const cachedChats = await getCurrentChats();
         if (cachedChats.length > 0) {
           socket.emit("chats", cachedChats);
         }
@@ -846,7 +914,7 @@ app.prepare().then(() => {
       lastGetChatsTime = now;
 
       // Send cached chats immediately while fetching new ones
-      const cachedChats = getCurrentChats();
+      const cachedChats = await getCurrentChats();
       if (cachedChats.length > 0) {
         console.log(`Sending ${cachedChats.length} cached chats first`);
         socket.emit("chats", cachedChats);
@@ -865,6 +933,20 @@ app.prepare().then(() => {
               await delay(2000);
               continue;
             }
+            
+            // Check if page is truly healthy before proceeding
+            const pageHealthy = await isPageHealthy();
+            if (!pageHealthy) {
+              console.log("Page is not healthy, marking client as not ready");
+              clientReadyStates.set(currentAccountId, false);
+              isReady = false;
+              io.emit("status", { isReady: false, reason: "page_detached" });
+              consecutiveDetachErrors++;
+              return null; // Signal to use cached data
+            }
+            
+            // Reset consecutive errors on healthy page
+            consecutiveDetachErrors = 0;
             
             // Check if client info is available
             const info = whatsappClient.info;
@@ -885,9 +967,19 @@ app.prepare().then(() => {
           } catch (error) {
             console.error(`Attempt ${i + 1} failed:`, error.message);
             
-            // If it's a detached frame error, the page is gone - don't retry, use cache
-            if (error.message.includes('detached Frame') || error.message.includes('Target closed')) {
-              console.log("Browser page detached, returning cached data");
+            // If it's a detached frame error, mark client as not ready and don't retry
+            const isDetachError = error.message.includes('detached Frame') || 
+                                  error.message.includes('Target closed') ||
+                                  error.message.includes('Session closed') ||
+                                  error.message.includes('Protocol error') ||
+                                  error.message.includes('Execution context');
+            
+            if (isDetachError) {
+              console.log("Browser page detached, marking as not ready and returning cached data");
+              clientReadyStates.set(currentAccountId, false);
+              isReady = false;
+              io.emit("status", { isReady: false, reason: "page_detached" });
+              consecutiveDetachErrors++;
               return null; // Signal to use cached data
             }
             
