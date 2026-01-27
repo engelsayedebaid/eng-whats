@@ -98,6 +98,11 @@ interface SocketContextType {
   accounts: Account[];
   currentAccountId: string | null;
   connectionError: string | null;
+  connectionHealth: {
+    status: 'healthy' | 'degraded' | 'error' | 'unknown';
+    message: string;
+    canReconnect: boolean;
+  };
   setPrivacyMode: (value: boolean) => void;
   fetchChats: () => void;
   fetchMessages: (chatId: string) => void;
@@ -112,6 +117,7 @@ interface SocketContextType {
   switchAccount: (accountId: string) => void;
   deleteAccount: (accountId: string) => void;
   clearSessions: () => void;
+  requestReconnect: () => void;
 }
 
 const defaultSyncProgress: SyncProgress = {
@@ -162,6 +168,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  const [connectionHealth, setConnectionHealth] = useState<{
+    status: 'healthy' | 'degraded' | 'error' | 'unknown';
+    message: string;
+    canReconnect: boolean;
+  }>({ status: 'unknown', message: '', canReconnect: false });
 
   useEffect(() => {
     // Get backend URL from environment variable or default to current origin
@@ -174,11 +185,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       transports: ['polling', 'websocket'],
       // Allow transport upgrade
       upgrade: true,
-      // Reconnection settings
+      // Reconnection settings - keep trying forever for better stability
       reconnection: true,
-      reconnectionAttempts: 10,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
+      reconnectionDelayMax: 10000,
       // Timeout settings for production
       timeout: 20000,
       // Force new connection
@@ -247,11 +258,46 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       setIsReady(true);
       setQrCode(null);
       setIsLoading(true);
+      setConnectionHealth({ status: 'healthy', message: 'متصل', canReconnect: false });
+      // Start heartbeat for connection monitoring
+      newSocket.emit("startHeartbeat");
       // بدء المزامنة التلقائية بعد الاتصال
       setTimeout(() => {
         console.log("Starting automatic sync after ready...");
         newSocket.emit("syncAllChats", { maxChats: 1000 });
       }, 2000);
+    });
+
+    // Connection health monitoring from server heartbeat
+    newSocket.on("connectionHealth", (data: {
+      status: 'healthy' | 'degraded' | 'error';
+      message: string;
+      canReconnect: boolean;
+    }) => {
+      setConnectionHealth(data);
+      if (data.status === 'error' || data.status === 'degraded') {
+        setConnectionError(data.message);
+      } else {
+        setConnectionError(null);
+      }
+    });
+
+    // Handle reconnection events from server
+    newSocket.on("reconnecting", (data: { attempt: number; manual?: boolean }) => {
+      console.log(`Server reconnecting, attempt ${data.attempt}`);
+      setConnectionError(`جاري إعادة الاتصال... (المحاولة ${data.attempt})`);
+      setConnectionHealth({ status: 'degraded', message: 'جاري إعادة الاتصال', canReconnect: false });
+    });
+
+    // Handle reconnection failure from server
+    newSocket.on("reconnectFailed", (data: { reason: string; canManualRetry: boolean }) => {
+      console.error("Server reconnect failed:", data.reason);
+      setConnectionError(`فشل إعادة الاتصال: ${data.reason}`);
+      setConnectionHealth({
+        status: 'error',
+        message: data.reason,
+        canReconnect: data.canManualRetry
+      });
     });
 
     newSocket.on("chats", (data: Chat[]) => {
@@ -321,11 +367,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     newSocket.on("quickSyncData", (updates: Array<{ id: string; name?: string; unreadCount: number; timestamp: number; lastMessageBody: string | null; lastMessageFromMe: boolean; lastMessageType?: string }>) => {
       // Ensure updates is an array
       if (!Array.isArray(updates)) return;
-      
+
       setChats(prev => {
         const updated = [...prev];
         const existingIds = new Set(prev.map(c => c.id));
-        
+
         for (const update of updates) {
           const index = updated.findIndex(c => c.id === update.id);
           if (index >= 0) {
@@ -370,17 +416,17 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         return updated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       });
     });
-    
+
     // Handle profile picture updates
     newSocket.on("profilePic", (data: { chatId: string; url: string | null }) => {
-      setChats(prev => prev.map(chat => 
+      setChats(prev => prev.map(chat =>
         chat.id === data.chatId ? { ...chat, profilePic: data.url } : chat
       ));
     });
-    
+
     // Handle batch profile picture updates
     newSocket.on("profilePics", (data: Record<string, string | null>) => {
-      setChats(prev => prev.map(chat => 
+      setChats(prev => prev.map(chat =>
         data[chat.id] !== undefined ? { ...chat, profilePic: data[chat.id] } : chat
       ));
     });
@@ -661,6 +707,16 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, [socket]);
 
+  // Request manual reconnection from server
+  const requestReconnect = useCallback(() => {
+    if (socket) {
+      console.log("Requesting manual reconnection...");
+      setConnectionError("جاري إعادة الاتصال...");
+      setConnectionHealth({ status: 'degraded', message: 'جاري إعادة الاتصال', canReconnect: false });
+      socket.emit("requestReconnect");
+    }
+  }, [socket]);
+
   return (
     <SocketContext.Provider
       value={{
@@ -677,6 +733,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         accounts,
         currentAccountId,
         connectionError,
+        connectionHealth,
         setPrivacyMode,
         fetchChats,
         fetchMessages,
@@ -691,6 +748,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         switchAccount,
         deleteAccount,
         clearSessions,
+        requestReconnect,
       }}
     >
       {children}

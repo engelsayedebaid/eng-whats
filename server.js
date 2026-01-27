@@ -401,6 +401,67 @@ app.prepare().then(() => {
     path: '/socket.io/',
   });
 
+  // ==================== Heartbeat System for Connection Health ====================
+  const HEARTBEAT_INTERVAL = 30000; // 30 seconds
+  const heartbeatIntervals = new Map();
+
+  // Helper function to check page health (moved earlier for reuse)
+  const checkPageHealth = async () => {
+    try {
+      if (!whatsappClient || !whatsappClient.pupPage) {
+        return false;
+      }
+      await whatsappClient.pupPage.evaluate(() => true);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const startHeartbeat = (socket, accountId) => {
+    stopHeartbeat(socket.id);
+    
+    const interval = setInterval(async () => {
+      if (!clientReadyStates.get(accountId)) {
+        socket.emit('connectionHealth', { 
+          status: 'degraded', 
+          message: 'WhatsApp connection lost',
+          canReconnect: true,
+          timestamp: Date.now()
+        });
+        return;
+      }
+      
+      try {
+        const isHealthy = await checkPageHealth();
+        socket.emit('connectionHealth', { 
+          status: isHealthy ? 'healthy' : 'degraded',
+          message: isHealthy ? 'Connected' : 'Connection unstable',
+          canReconnect: !isHealthy,
+          timestamp: Date.now()
+        });
+      } catch (e) {
+        socket.emit('connectionHealth', { 
+          status: 'error', 
+          message: e.message,
+          canReconnect: true,
+          timestamp: Date.now()
+        });
+      }
+    }, HEARTBEAT_INTERVAL);
+    
+    heartbeatIntervals.set(socket.id, interval);
+    console.log(`Started heartbeat for socket ${socket.id}`);
+  };
+
+  const stopHeartbeat = (socketId) => {
+    if (heartbeatIntervals.has(socketId)) {
+      clearInterval(heartbeatIntervals.get(socketId));
+      heartbeatIntervals.delete(socketId);
+      console.log(`Stopped heartbeat for socket ${socketId}`);
+    }
+  };
+
   // Setup WhatsApp client events
   const setupClientEvents = (client, accountId) => {
     client.on("qr", (qr) => {
@@ -482,21 +543,56 @@ app.prepare().then(() => {
       }
     });
 
-    client.on("disconnected", (reason) => {
+    client.on("disconnected", async (reason) => {
       console.log(`WhatsApp disconnected for account ${accountId}:`, reason);
       // Mark this client as not ready
       clientReadyStates.set(accountId, false);
       
       if (currentAccountId === accountId) {
         isReady = false;
-        io.emit("status", { isReady: false });
-        io.emit("disconnected", { reason });
-      }
-      
-      // Update session state in Convex
-      if (isConvexReady()) {
-        sessionsDb.setDisconnected(accountId, reason).catch(() => {});
-        eventsDb.log(accountId, "disconnected", reason).catch(() => {});
+        io.emit("status", { isReady: false, reason: reason });
+        io.emit("disconnected", { reason, canReconnect: true });
+        
+        // Update session state in Convex
+        if (isConvexReady()) {
+          sessionsDb.setDisconnected(accountId, reason).catch(() => {});
+          eventsDb.log(accountId, "disconnected", reason).catch(() => {});
+        }
+        
+        // Auto-reconnect after 10 seconds
+        console.log('Will attempt auto-reconnect in 10 seconds...');
+        setTimeout(async () => {
+          if (currentAccountId === accountId && !clientReadyStates.get(accountId)) {
+            console.log('Attempting automatic reconnection...');
+            io.emit("status", { isReady: false, reason: "reconnecting" });
+            io.emit("reconnecting", { attempt: 1 });
+            
+            try {
+              // Clean up old client
+              whatsappClients.delete(accountId);
+              clientReadyStates.delete(accountId);
+              await cleanupOrphanedBrowser(accountId);
+              
+              // Wait before reinitializing
+              await new Promise(r => setTimeout(r, 2000));
+              
+              // Reinitialize
+              await initializeAccount(accountId, 0);
+              console.log('Auto-reconnect initiated successfully');
+            } catch (err) {
+              console.error('Auto-reconnect failed:', err.message);
+              io.emit("reconnectFailed", { 
+                reason: err.message,
+                canManualRetry: true 
+              });
+              
+              // Log to Convex
+              if (isConvexReady()) {
+                eventsDb.log(accountId, "reconnect_failed", err.message).catch(() => {});
+              }
+            }
+          }
+        }, 10000);
       }
     });
 
@@ -859,7 +955,7 @@ app.prepare().then(() => {
     let isGettingChats = false;
     let lastGetChatsTime = 0;
     let consecutiveDetachErrors = 0;
-    const GET_CHATS_THROTTLE = 30000; // 30 seconds between getChats calls (increased to reduce load)
+    const GET_CHATS_THROTTLE = 15000; // 15 seconds between getChats calls (reduced for fresher data)
 
     // Helper function to check if page is still healthy
     const isPageHealthy = async () => {
@@ -1118,6 +1214,36 @@ app.prepare().then(() => {
 
     // Messages cache for fallback
     const messagesCache = new Map();
+    
+    // ==================== Memory Cleanup for Message Cache ====================
+    // Clean up old message cache entries periodically to prevent memory leaks
+    const messagesCacheCleanupInterval = setInterval(() => {
+      const MAX_CACHE_AGE = 10 * 60 * 1000; // 10 minutes
+      const now = Date.now();
+      let cleaned = 0;
+      
+      for (const [chatId, cached] of messagesCache.entries()) {
+        if (now - cached.timestamp > MAX_CACHE_AGE) {
+          messagesCache.delete(chatId);
+          cleaned++;
+        }
+      }
+      
+      // Also limit cache size to prevent unbounded growth
+      if (messagesCache.size > 100) {
+        const entries = Array.from(messagesCache.entries());
+        entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+        const toDelete = entries.slice(0, entries.length - 100);
+        toDelete.forEach(([key]) => {
+          messagesCache.delete(key);
+          cleaned++;
+        });
+      }
+      
+      if (cleaned > 0) {
+        console.log(`Cleaned ${cleaned} old entries from messages cache`);
+      }
+    }, 5 * 60 * 1000); // Run every 5 minutes
     
     // Helper: Check if client is truly ready
     const isClientReady = () => {
@@ -2897,8 +3023,60 @@ app.prepare().then(() => {
       }
     });
 
+    // ==================== Manual Reconnect Handler ====================
+    socket.on("requestReconnect", async () => {
+      console.log("Manual reconnect requested by client...");
+      
+      if (!currentAccountId) {
+        socket.emit("reconnectFailed", { reason: "No active account", canManualRetry: false });
+        return;
+      }
+      
+      socket.emit("status", { isReady: false, reason: "reconnecting" });
+      socket.emit("reconnecting", { attempt: 1, manual: true });
+      
+      try {
+        const existingClient = whatsappClients.get(currentAccountId);
+        if (existingClient) {
+          try {
+            await existingClient.destroy();
+          } catch (e) {
+            console.log("Client already destroyed:", e.message);
+          }
+        }
+        
+        whatsappClients.delete(currentAccountId);
+        clientReadyStates.delete(currentAccountId);
+        await cleanupOrphanedBrowser(currentAccountId);
+        
+        await new Promise(r => setTimeout(r, 2000));
+        
+        await initializeAccount(currentAccountId, 0);
+        console.log("Manual reconnect initiated successfully");
+      } catch (err) {
+        console.error("Manual reconnect failed:", err.message);
+        socket.emit("reconnectFailed", { 
+          reason: err.message,
+          canManualRetry: true 
+        });
+        
+        // Log to Convex
+        if (isConvexReady()) {
+          eventsDb.log(currentAccountId, "manual_reconnect_failed", err.message).catch(() => {});
+        }
+      }
+    });
+
+    // Start heartbeat when WhatsApp is ready
+    socket.on("startHeartbeat", () => {
+      if (currentAccountId && isReady) {
+        startHeartbeat(socket, currentAccountId);
+      }
+    });
+
     socket.on("disconnect", () => {
       console.log("Client disconnected:", socket.id);
+      stopHeartbeat(socket.id);
     });
 
   });
