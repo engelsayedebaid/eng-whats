@@ -1,0 +1,9 @@
+node_modules
+.wwebjs_auth
+.wwebjs_cache
+.next
+.git
+.chats_cache
+copy-and-run.bat
+exclude.txt
+accounts.json

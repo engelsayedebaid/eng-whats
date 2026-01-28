@@ -7,6 +7,46 @@ import {
   Play, Pause, Download, X, Volume2, ZoomIn, Loader2, ChevronDown, ChevronUp
 } from "lucide-react";
 
+// Format phone number for better readability
+function formatPhoneNumber(phone: string | undefined): string {
+  if (!phone) return "";
+
+  // Remove any non-digit characters
+  const cleaned = phone.replace(/[^\d]/g, "");
+
+  if (!cleaned) return "";
+
+  // Saudi Arabia numbers: 966 + 9 digits (total 12)
+  if (cleaned.startsWith("966") && cleaned.length === 12) {
+    // Format: +966 XX XXX XXXX
+    return `+966 ${cleaned.slice(3, 5)} ${cleaned.slice(5, 8)} ${cleaned.slice(8)}`;
+  }
+
+  // Egypt numbers: 20 + 10 digits (total 12)
+  if (cleaned.startsWith("20") && cleaned.length === 12) {
+    return `+20 ${cleaned.slice(2, 5)} ${cleaned.slice(5, 8)} ${cleaned.slice(8)}`;
+  }
+
+  // General formatting for other numbers
+  let countryCodeLength = 1;
+  if (cleaned.length > 11) {
+    countryCodeLength = 3;
+  } else if (cleaned.length > 10) {
+    countryCodeLength = 2;
+  }
+
+  const countryCode = "+" + cleaned.slice(0, countryCodeLength);
+  const rest = cleaned.slice(countryCodeLength);
+
+  // Format the rest of the number in groups of 3
+  let formatted = countryCode;
+  for (let i = 0; i < rest.length; i += 3) {
+    formatted += " " + rest.slice(i, i + 3);
+  }
+
+  return formatted.trim();
+}
+
 // Expandable Text Component for large messages
 function ExpandableText({ text, maxLength = 500 }: { text: string; maxLength?: number }) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -390,11 +430,21 @@ export default function ChatWindow({ chatId }: { chatId: string | null }) {
           <h3 className="font-semibold text-white">
             <PrivacyText isBlurred={privacyMode}>{chat?.name || "محادثة"}</PrivacyText>
           </h3>
-          <p className="text-xs text-gray-400">
-            <PrivacyText isBlurred={privacyMode}>
-              {chat?.isGroup ? `مجموعة (${chat?.participantCount || 0})` : chat?.phone ? `+${chat?.phone}` : "محادثة خاصة"}
-            </PrivacyText>
-          </p>
+          {chat?.isGroup ? (
+            <p className="text-xs text-gray-400">
+              <PrivacyText isBlurred={privacyMode}>
+                مجموعة ({chat?.participantCount || 0})
+              </PrivacyText>
+            </p>
+          ) : chat?.phone ? (
+            <p dir="ltr" className="text-xs text-gray-400 phone-number" style={{ textAlign: 'left' }}>
+              <PrivacyText isBlurred={privacyMode}>
+                {formatPhoneNumber(chat.phone)}
+              </PrivacyText>
+            </p>
+          ) : (
+            <p className="text-xs text-gray-400">محادثة خاصة</p>
+          )}
         </div>
       </div>
 
@@ -471,9 +521,15 @@ export default function ChatWindow({ chatId }: { chatId: string | null }) {
                       >
                         {/* Sender name for group messages */}
                         {!msg.fromMe && chat?.isGroup && msg.senderName && (
-                          <p className="text-xs text-green-400 font-medium mb-1 ltr-num">
-                            {msg.senderName}
-                          </p>
+                          /^\d+$/.test(msg.senderName) ? (
+                            <p dir="ltr" className="text-xs text-green-400 font-medium mb-1 phone-number" style={{ textAlign: 'left' }}>
+                              {formatPhoneNumber(msg.senderName)}
+                            </p>
+                          ) : (
+                            <p className="text-xs text-green-400 font-medium mb-1">
+                              {msg.senderName}
+                            </p>
+                          )
                         )}
 
                         {/* Message content */}

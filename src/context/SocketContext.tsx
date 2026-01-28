@@ -84,6 +84,13 @@ interface Account {
   userId?: string;
 }
 
+interface PhoneState {
+  state: string;
+  isPhoneOnline: boolean;
+  message: string;
+  multiDeviceActive: boolean;
+}
+
 interface SocketContextType {
   socket: Socket | null;
   isConnected: boolean;
@@ -103,10 +110,12 @@ interface SocketContextType {
     message: string;
     canReconnect: boolean;
   };
+  phoneState: PhoneState;
+  multiDeviceEnabled: boolean;
   setPrivacyMode: (value: boolean) => void;
   fetchChats: () => void;
   fetchMessages: (chatId: string) => void;
-  syncAllChats: (maxChats?: number) => void;
+  syncAllChats: () => void; // No limit - syncs all chats
   quickSync: () => void;
   fetchProfilePics: (chatIds: string[]) => void;
   searchMessages: (query: string) => void;
@@ -173,6 +182,13 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     message: string;
     canReconnect: boolean;
   }>({ status: 'unknown', message: '', canReconnect: false });
+  const [phoneState, setPhoneState] = useState<PhoneState>({
+    state: 'UNKNOWN',
+    isPhoneOnline: true,
+    message: '',
+    multiDeviceActive: true
+  });
+  const [multiDeviceEnabled, setMultiDeviceEnabled] = useState(true);
 
   useEffect(() => {
     // Get backend URL from environment variable or default to current origin
@@ -185,13 +201,14 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       transports: ['polling', 'websocket'],
       // Allow transport upgrade
       upgrade: true,
-      // Reconnection settings - keep trying forever for better stability
+      // Reconnection settings - reasonable limits to avoid infinite loops
       reconnection: true,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: 20, // Try 20 times before showing error
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 10000,
+      reconnectionDelayMax: 30000, // Max 30 seconds between attempts
+      randomizationFactor: 0.5, // Add some randomization to prevent thundering herd
       // Timeout settings for production
-      timeout: 20000,
+      timeout: 30000, // 30 seconds for initial connection
       // Force new connection
       forceNew: true,
       // Path must match server configuration
@@ -264,7 +281,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       // بدء المزامنة التلقائية بعد الاتصال
       setTimeout(() => {
         console.log("Starting automatic sync after ready...");
-        newSocket.emit("syncAllChats", { maxChats: 1000 });
+        newSocket.emit("syncAllChats", {}); // No limit - load all chats
       }, 2000);
     });
 
@@ -300,6 +317,19 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       });
     });
 
+    // ==================== Multi-Device Phone State Tracking ====================
+    // This tracks whether the phone is online/offline - with Multi-Device, app continues to work
+    newSocket.on("phoneState", (data: PhoneState) => {
+      console.log("Phone state changed:", data);
+      setPhoneState(data);
+      setMultiDeviceEnabled(data.multiDeviceActive);
+
+      // Show info message but don't treat as error - Multi-Device keeps working
+      if (!data.isPhoneOnline && data.multiDeviceActive) {
+        console.log("Phone offline but Multi-Device active - continuing normally");
+      }
+    });
+
     newSocket.on("chats", (data: Chat[]) => {
       // Ensure data is always an array
       setChats(Array.isArray(data) ? data : []);
@@ -309,6 +339,63 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     newSocket.on("chatsError", () => {
       setIsLoading(false);
       setSyncProgress(defaultSyncProgress);
+    });
+
+    // ==================== Real-time Unread Count Updates ====================
+    // Update unread counts when messages are read from phone
+    newSocket.on("unreadCountUpdate", (updates: { chatId: string; unreadCount: number; timestamp: number }[]) => {
+      console.log("Unread count updates received:", updates.length);
+
+      setChats(prevChats => {
+        const newChats = [...prevChats];
+        let hasChanges = false;
+
+        for (const update of updates) {
+          const chatIndex = newChats.findIndex(c => c.id === update.chatId);
+          if (chatIndex !== -1 && newChats[chatIndex].unreadCount !== update.unreadCount) {
+            newChats[chatIndex] = {
+              ...newChats[chatIndex],
+              unreadCount: update.unreadCount
+            };
+            hasChanges = true;
+            console.log(`Updated unread count for ${newChats[chatIndex].name}: ${update.unreadCount}`);
+          }
+        }
+
+        return hasChanges ? newChats : prevChats;
+      });
+    });
+
+    // Track when messages are read by recipients
+    newSocket.on("messageRead", (data: { chatId: string; messageId: string; timestamp: number }) => {
+      console.log("Message read:", data.chatId);
+      // Can be used to update message status (double blue tick)
+    });
+
+    // Track when messages are deleted
+    newSocket.on("messageRevoked", (data: { chatId: string; messageId: string; timestamp: number }) => {
+      console.log("Message revoked:", data.chatId);
+      // Can be used to update UI when message is deleted
+    });
+
+    // Handle chat updates (for real-time lastMessage updates)
+    newSocket.on("chatUpdate", (data: { chatId: string; lastMessage: Chat["lastMessage"]; timestamp: number }) => {
+      console.log("Chat update received:", data.chatId);
+      setChats(prevChats => {
+        const chatIndex = prevChats.findIndex(c => c.id === data.chatId);
+        if (chatIndex === -1) return prevChats;
+
+        const newChats = [...prevChats];
+        newChats[chatIndex] = {
+          ...newChats[chatIndex],
+          lastMessage: data.lastMessage,
+          timestamp: data.timestamp
+        };
+
+        // Re-sort by timestamp
+        newChats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        return newChats;
+      });
     });
 
     // Sync progress handler
@@ -596,17 +683,18 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, [socket, isReady]);
 
-  const syncAllChats = useCallback((maxChats: number = 500) => {
+  // Sync all chats without any limit
+  const syncAllChats = useCallback(() => {
     if (socket && isReady) {
       setIsLoading(true);
       setSyncProgress({
         status: "started",
-        message: "جاري بدء المزامنة السريعة...",
+        message: "جاري بدء المزامنة...",
         progress: 0,
         total: 0,
         current: 0,
       });
-      socket.emit("syncAllChats", { maxChats });
+      socket.emit("syncAllChats", {}); // No maxChats limit
     }
   }, [socket, isReady]);
 
@@ -734,6 +822,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         currentAccountId,
         connectionError,
         connectionHealth,
+        phoneState,
+        multiDeviceEnabled,
         setPrivacyMode,
         fetchChats,
         fetchMessages,

@@ -19,8 +19,27 @@
 /* Numbers should be LTR */
 .ltr-num {
   direction: ltr !important;
-  unicode-bidi: isolate !important;
+  unicode-bidi: plaintext !important;
   display: inline-block;
+  text-align: left;
+}
+
+/* Phone number specific styling */
+.phone-number {
+  direction: ltr !important;
+  unicode-bidi: plaintext !important;
+  display: inline-block;
+  text-align: left;
+  font-family: 'Roboto', 'Arial', sans-serif;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.5px;
+}
+
+/* Ensure all numbers in chat are displayed correctly */
+[dir="rtl"] .ltr-num,
+[dir="rtl"] .phone-number {
+  direction: ltr !important;
+  unicode-bidi: plaintext !important;
 }
 
 

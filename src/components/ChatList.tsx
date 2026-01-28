@@ -15,14 +15,56 @@ type DateFilterType = "all" | "today" | "week" | "month";
 type TypeFilterType = "all" | "text" | "media" | "voice" | "document";
 type ChatTypeFilter = "all" | "private" | "groups";
 
+// Format phone number for better readability
+function formatPhoneNumber(phone: string | undefined): string {
+  if (!phone) return "";
+
+  // Remove any non-digit characters
+  const cleaned = phone.replace(/[^\d]/g, "");
+
+  if (!cleaned) return "";
+
+  // Saudi Arabia numbers: 966 + 9 digits (total 12)
+  if (cleaned.startsWith("966") && cleaned.length === 12) {
+    // Format: +966 XX XXX XXXX
+    return `+966 ${cleaned.slice(3, 5)} ${cleaned.slice(5, 8)} ${cleaned.slice(8)}`;
+  }
+
+  // Egypt numbers: 20 + 10 digits (total 12)
+  if (cleaned.startsWith("20") && cleaned.length === 12) {
+    return `+20 ${cleaned.slice(2, 5)} ${cleaned.slice(5, 8)} ${cleaned.slice(8)}`;
+  }
+
+  // General formatting for other numbers
+  let countryCodeLength = 1;
+  if (cleaned.length > 11) {
+    countryCodeLength = 3;
+  } else if (cleaned.length > 10) {
+    countryCodeLength = 2;
+  }
+
+  const countryCode = "+" + cleaned.slice(0, countryCodeLength);
+  const rest = cleaned.slice(countryCodeLength);
+
+  // Format the rest of the number in groups of 3
+  let formatted = countryCode;
+  for (let i = 0; i < rest.length; i += 3) {
+    formatted += " " + rest.slice(i, i + 3);
+  }
+
+  return formatted.trim();
+}
+
 // LTR Text Component for proper number display
 function LTRText({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
     <span
+      dir="ltr"
       style={{
         direction: 'ltr',
-        unicodeBidi: 'embed',
-        display: 'inline-block'
+        unicodeBidi: 'plaintext',
+        display: 'inline-block',
+        textAlign: 'left'
       }}
       className={className}
     >
@@ -229,7 +271,7 @@ export default function ChatList({
         .slice(0, 20)
         .filter(chat => !chat.profilePic)
         .map(chat => chat.id);
-      
+
       if (chatsNeedingPics.length > 0) {
         // Delay to not interfere with initial render
         const timer = setTimeout(() => {
@@ -238,7 +280,7 @@ export default function ChatList({
         return () => clearTimeout(timer);
       }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, syncProgress.status]);
 
   // Date filter helpers
@@ -924,7 +966,7 @@ export default function ChatList({
                     })}
                   </span>
                 </div>
-                <p dir="ltr" className="text-xs text-gray-500 mb-1">+{result.chatPhone}</p>
+                <p dir="ltr" className="text-xs text-gray-500 mb-1 phone-number">{formatPhoneNumber(result.chatPhone)}</p>
                 <div className="flex items-center gap-1">
                   {result.fromMe && <CheckCheck className="w-3 h-3 text-green-500 flex-shrink-0" />}
                   <p className="text-sm text-gray-300 line-clamp-2">
@@ -1040,9 +1082,11 @@ export default function ChatList({
 
                   {/* Phone Number */}
                   {!chat.isGroup && chat.phone && (
-                    <PrivacyText isBlurred={privacyMode} className="text-xs text-gray-500">
-                      +{chat.phone}
-                    </PrivacyText>
+                    <div dir="ltr" className="text-xs text-gray-500 phone-number">
+                      <PrivacyText isBlurred={privacyMode}>
+                        {formatPhoneNumber(chat.phone)}
+                      </PrivacyText>
+                    </div>
                   )}
 
                   {/* Last Message with sender and type */}
@@ -1053,7 +1097,10 @@ export default function ChatList({
                     {chat.lastMessage && getMessageTypeIcon(chat.lastMessage.type)}
                     <PrivacyText isBlurred={privacyMode} className="text-sm text-gray-400 truncate">
                       {chat.isGroup && !chat.lastMessage?.fromMe && chat.lastMessage?.senderName && (
-                        <span className="text-green-400">{chat.lastMessage.senderName}: </span>
+                        <span className="text-green-400">
+                          {/^\d+$/.test(chat.lastMessage.senderName)
+                            ? <span dir="ltr" className="phone-number">{formatPhoneNumber(chat.lastMessage.senderName)}</span>
+                            : chat.lastMessage.senderName}: </span>
                       )}
                       {chat.lastMessage?.body || chat.lastMessage?.typeLabel || "لا توجد رسائل"}
                     </PrivacyText>

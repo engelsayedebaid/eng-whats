@@ -132,7 +132,7 @@ export default function Sidebar() {
             <div className="flex flex-col items-center gap-2 text-center">
               {/* Made with love */}
               <div className="flex items-center gap-1.5 text-xs text-gray-400">
-                <span>صنع بحب بواسطه</span>
+                <span>صنع بواسطه</span>
                 <Heart className="w-3.5 h-3.5 text-red-500 fill-red-500 animate-pulse" />
               </div>
               <a
@@ -145,7 +145,7 @@ export default function Sidebar() {
               </a>
               {/* Version */}
               <div className="text-xs text-gray-500 mt-1">
-                v0.1.0
+                v2.1.0
               </div>
             </div>
           </div>

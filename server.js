@@ -226,11 +226,10 @@ const getChromiumPath = () => {
   return undefined; // Use bundled Chromium
 };
 
-// Cleanup function for orphaned browser sessions
+// Cleanup function for orphaned browser sessions - improved for Windows 10/11
 const cleanupOrphanedBrowser = async (accountId) => {
   const { exec } = require('child_process');
   const sessionPath = path.join(__dirname, '.wwebjs_auth', `session-${accountId}`);
-  const lockFile = path.join(sessionPath, 'SingletonLock');
   
   console.log(`Cleaning up browser for account: ${accountId}`);
   
@@ -251,17 +250,32 @@ const cleanupOrphanedBrowser = async (accountId) => {
   // Kill Chrome processes using this session
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
-      // Windows
-      const userDataDir = sessionPath.replace(/\\/g, '\\\\');
-      exec(`wmic process where "commandline like '%${userDataDir}%' and name='chrome.exe'" call terminate`, (error) => {
-        if (!error) {
-          console.log(`Terminated orphaned Chrome processes for ${accountId}`);
+      // Windows 10/11 - use taskkill and PowerShell instead of deprecated wmic
+      const cleanupCommands = [];
+      
+      // Method 1: Try PowerShell command (works on Windows 10/11)
+      const psCommand = `powershell -Command "Get-Process chrome -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*${accountId}*'} | Stop-Process -Force -ErrorAction SilentlyContinue"`;
+      cleanupCommands.push(psCommand);
+      
+      // Method 2: Fallback to taskkill for general Chrome cleanup
+      const taskKillCommand = `taskkill /F /IM chrome.exe /T 2>nul`;
+      
+      exec(psCommand, (error) => {
+        if (error) {
+          console.log(`PowerShell cleanup: ${error.message || 'no matching processes'}`);
+          // Fallback: try wmic for older Windows
+          const userDataDir = sessionPath.replace(/\\/g, '\\\\');
+          exec(`wmic process where "commandline like '%${userDataDir}%' and name='chrome.exe'" call terminate 2>nul`, () => {
+            console.log(`Cleanup completed for ${accountId} (Windows fallback)`);
+            setTimeout(resolve, 2000);
+          });
+        } else {
+          console.log(`Terminated Chrome processes for ${accountId} (PowerShell)`);
+          setTimeout(resolve, 2000);
         }
-        setTimeout(resolve, 1500);
       });
     } else {
       // Linux/Mac - more aggressive cleanup
-      // Kill ANY chromium processes that might be orphaned
       const commands = [
         `pkill -9 -f "chromium.*${accountId}" 2>/dev/null || true`,
         `pkill -9 -f "chrome.*${accountId}" 2>/dev/null || true`,
@@ -270,8 +284,8 @@ const cleanupOrphanedBrowser = async (accountId) => {
       ];
       
       exec(commands.join(' && '), () => {
-        console.log(`Cleanup completed for ${accountId} (Linux)`);
-        setTimeout(resolve, 1500);
+        console.log(`Cleanup completed for ${accountId} (Linux/Mac)`);
+        setTimeout(resolve, 2000);
       });
     }
   });
@@ -306,12 +320,32 @@ const whatsappClients = new Map();
 const clientReadyStates = new Map();
 
 
-// Create WhatsApp client for a specific account
+// ==================== Connection Stability Constants ====================
+const MAX_RECONNECT_ATTEMPTS = 5; // حد أقصى لمحاولات إعادة الاتصال
+const RECONNECT_DELAY_BASE = 5000; // 5 ثوان أساسية
+const RECONNECT_DELAY_MAX = 60000; // دقيقة واحدة كحد أقصى
+let reconnectAttempts = new Map(); // accountId -> attempts count
+let reconnectTimeouts = new Map(); // accountId -> timeout reference
+
+// Create WhatsApp client for a specific account with Multi-Device support
 const createWhatsAppClient = (accountId) => {
-  console.log(`Creating WhatsApp client for account: ${accountId}`);
+  console.log(`Creating WhatsApp client for account: ${accountId} (Multi-Device enabled)`);
   
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: accountId }),
+    authStrategy: new LocalAuth({ 
+      clientId: accountId,
+      dataPath: path.join(__dirname, '.wwebjs_auth'),
+    }),
+    // Multi-Device Support - يعمل حتى لو الهاتف مغلق
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/AcidOps/whatsapp-web-version-cache/main/webVersions.json',
+    },
+    // تاكيد على Multi-Device
+    takeoverOnConflict: true, // استيلاء على الجلسة عند التعارض
+    takeoverTimeoutMs: 0, // فوري
+    qrMaxRetries: 5, // عدد محاولات QR
+    // Puppeteer settings
     puppeteer: {
       headless: true,
       executablePath: getChromiumPath(),
@@ -325,7 +359,7 @@ const createWhatsAppClient = (accountId) => {
         "--disable-web-security",
         "--disable-features=IsolateOrigins,site-per-process",
         "--disable-blink-features=AutomationControlled",
-        // Memory optimization flags - NOTE: --single-process removed to prevent frame detachment
+        // Memory optimization flags
         "--disable-extensions",
         "--disable-plugins",
         "--disable-translate",
@@ -348,12 +382,22 @@ const createWhatsAppClient = (accountId) => {
         "--disable-software-rasterizer",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
+        // Keep-alive flags for Multi-Device
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-ipc-flooding-protection",
       ],
-      timeout: 0,
+      // Proper timeouts to avoid hanging
+      timeout: 120000, // 2 دقائق للتحميل الأولي
       ignoreHTTPSErrors: true,
-      protocolTimeout: 3600000,
+      protocolTimeout: 180000, // 3 دقائق للعمليات الفردية
     },
+    // Retry configuration
+    restartOnAuthFail: true,
   });
+  
+  // Reset reconnect attempts for this account
+  reconnectAttempts.set(accountId, 0);
   
   return client;
 };
@@ -405,15 +449,24 @@ app.prepare().then(() => {
   const HEARTBEAT_INTERVAL = 30000; // 30 seconds
   const heartbeatIntervals = new Map();
 
-  // Helper function to check page health (moved earlier for reuse)
+  // Helper function to check page health using getCurrentClient
   const checkPageHealth = async () => {
     try {
-      if (!whatsappClient || !whatsappClient.pupPage) {
+      const client = getCurrentClient();
+      if (!client || !client.pupPage) {
+        console.log('Heartbeat: No active client or page');
         return false;
       }
-      await whatsappClient.pupPage.evaluate(() => true);
-      return true;
+      // Use Promise.race to add timeout protection
+      const result = await Promise.race([
+        client.pupPage.evaluate(() => true),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Page health check timeout')), 10000)
+        )
+      ]);
+      return result === true;
     } catch (e) {
+      console.log('Heartbeat: Page health check failed:', e.message);
       return false;
     }
   };
@@ -422,12 +475,21 @@ app.prepare().then(() => {
     stopHeartbeat(socket.id);
     
     const interval = setInterval(async () => {
+      // Check if this account is still the active one
+      if (currentAccountId !== accountId) {
+        console.log(`Heartbeat: Account ${accountId} no longer active, stopping`);
+        stopHeartbeat(socket.id);
+        return;
+      }
+      
       if (!clientReadyStates.get(accountId)) {
         socket.emit('connectionHealth', { 
           status: 'degraded', 
-          message: 'WhatsApp connection lost',
+          message: 'تم فقد اتصال واتساب',
           canReconnect: true,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          attempts: reconnectAttempts.get(accountId) || 0,
+          maxAttempts: MAX_RECONNECT_ATTEMPTS
         });
         return;
       }
@@ -436,11 +498,21 @@ app.prepare().then(() => {
         const isHealthy = await checkPageHealth();
         socket.emit('connectionHealth', { 
           status: isHealthy ? 'healthy' : 'degraded',
-          message: isHealthy ? 'Connected' : 'Connection unstable',
+          message: isHealthy ? 'متصل' : 'الاتصال غير مستقر',
           canReconnect: !isHealthy,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          multiDevice: true // Indicate Multi-Device is enabled
         });
+        
+        // If not healthy and client thinks it's ready, mark it as not ready
+        if (!isHealthy && clientReadyStates.get(accountId)) {
+          console.log('Heartbeat: Page unhealthy but marked as ready, updating state');
+          clientReadyStates.set(accountId, false);
+          isReady = false;
+          io.emit("status", { isReady: false, reason: "page_unhealthy" });
+        }
       } catch (e) {
+        console.error('Heartbeat error:', e.message);
         socket.emit('connectionHealth', { 
           status: 'error', 
           message: e.message,
@@ -451,7 +523,7 @@ app.prepare().then(() => {
     }, HEARTBEAT_INTERVAL);
     
     heartbeatIntervals.set(socket.id, interval);
-    console.log(`Started heartbeat for socket ${socket.id}`);
+    console.log(`Started heartbeat for socket ${socket.id} (account: ${accountId})`);
   };
 
   const stopHeartbeat = (socketId) => {
@@ -500,16 +572,19 @@ app.prepare().then(() => {
             }
           }
         } catch (e) {
-          console.error("Error getting client info:", e.message);
+        console.error("Error getting client info:", e.message);
         }
-        io.emit("status", { isReady: true });
+        io.emit("status", { isReady: true, multiDevice: true });
         io.emit("ready");
+        
+        // Reset reconnect attempts on successful connection
+        reconnectAttempts.set(accountId, 0);
         
         // Update session state in Convex
         if (isConvexReady()) {
           sessionsDb.setReady(accountId, true).catch(() => {});
           sessionsDb.setAuthenticated(accountId, true).catch(() => {});
-          eventsDb.log(accountId, "ready", "WhatsApp client is ready").catch(() => {});
+          eventsDb.log(accountId, "ready", "WhatsApp client is ready (Multi-Device)").catch(() => {});
         }
         
         // Send cached chats immediately if available
@@ -521,9 +596,43 @@ app.prepare().then(() => {
       }
     });
 
+    // ==================== Multi-Device Support - Phone State Tracking ====================
+    // This event fires when phone connection state changes (online/offline)
+    // With Multi-Device, WhatsApp Web continues to work even if phone is offline
+    client.on("change_state", (state) => {
+      console.log(`WhatsApp state changed for ${accountId}: ${state}`);
+      
+      // State can be: CONFLICT, CONNECTED, DEPRECATED_VERSION, OPENING, PAIRING, PROXYBLOCK, SMB_TOS_BLOCK, TIMEOUT, TOS_BLOCK, UNLAUNCHED, UNPAIRED, UNPAIRED_IDLE
+      const isConnected = state === "CONNECTED";
+      
+      if (currentAccountId === accountId) {
+        io.emit("phoneState", { 
+          state: state,
+          isPhoneOnline: isConnected,
+          message: isConnected ? "الهاتف متصل" : `حالة الهاتف: ${state}`,
+          multiDeviceActive: true, // Multi-Device يعني الاستمرار حتى لو الهاتف مغلق
+          timestamp: Date.now()
+        });
+        
+        // Log state change
+        if (isConvexReady()) {
+          eventsDb.log(accountId, "phone_state_change", state).catch(() => {});
+        }
+      }
+    });
+
+    // Handle remote session conflicts (when phone logs into another WhatsApp Web)
+    client.on("remote_session_saved", () => {
+      console.log(`Remote session saved for ${accountId} - Multi-Device session persisted`);
+      if (isConvexReady()) {
+        eventsDb.log(accountId, "session_saved", "Multi-Device session persisted remotely").catch(() => {});
+      }
+    });
 
     client.on("authenticated", () => {
       console.log(`WhatsApp client authenticated for account: ${accountId}`);
+      // Reset reconnect attempts on successful auth
+      reconnectAttempts.set(accountId, 0);
       // Sync authentication state to Convex
       if (isConvexReady()) {
         sessionsDb.setAuthenticated(accountId, true).catch(() => {});
@@ -548,51 +657,101 @@ app.prepare().then(() => {
       // Mark this client as not ready
       clientReadyStates.set(accountId, false);
       
+      // Clear any pending reconnect timeout
+      if (reconnectTimeouts.has(accountId)) {
+        clearTimeout(reconnectTimeouts.get(accountId));
+        reconnectTimeouts.delete(accountId);
+      }
+      
       if (currentAccountId === accountId) {
         isReady = false;
+        
+        // Get current attempt count
+        const currentAttempts = reconnectAttempts.get(accountId) || 0;
+        const canAutoReconnect = currentAttempts < MAX_RECONNECT_ATTEMPTS;
+        
         io.emit("status", { isReady: false, reason: reason });
-        io.emit("disconnected", { reason, canReconnect: true });
+        io.emit("disconnected", { 
+          reason, 
+          canReconnect: canAutoReconnect,
+          attempts: currentAttempts,
+          maxAttempts: MAX_RECONNECT_ATTEMPTS 
+        });
         
         // Update session state in Convex
         if (isConvexReady()) {
           sessionsDb.setDisconnected(accountId, reason).catch(() => {});
-          eventsDb.log(accountId, "disconnected", reason).catch(() => {});
+          eventsDb.log(accountId, "disconnected", `${reason} (attempt ${currentAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`).catch(() => {});
         }
         
-        // Auto-reconnect after 10 seconds
-        console.log('Will attempt auto-reconnect in 10 seconds...');
-        setTimeout(async () => {
-          if (currentAccountId === accountId && !clientReadyStates.get(accountId)) {
-            console.log('Attempting automatic reconnection...');
-            io.emit("status", { isReady: false, reason: "reconnecting" });
-            io.emit("reconnecting", { attempt: 1 });
+        // Smart auto-reconnect with exponential backoff and attempt limits
+        if (canAutoReconnect) {
+          // Calculate delay with exponential backoff
+          const delay = Math.min(
+            RECONNECT_DELAY_BASE * Math.pow(2, currentAttempts),
+            RECONNECT_DELAY_MAX
+          );
+          
+          console.log(`Will attempt auto-reconnect in ${delay/1000}s (attempt ${currentAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`);
+          
+          const timeoutId = setTimeout(async () => {
+            reconnectTimeouts.delete(accountId);
             
-            try {
-              // Clean up old client
-              whatsappClients.delete(accountId);
-              clientReadyStates.delete(accountId);
-              await cleanupOrphanedBrowser(accountId);
+            if (currentAccountId === accountId && !clientReadyStates.get(accountId)) {
+              // Increment attempts
+              reconnectAttempts.set(accountId, currentAttempts + 1);
               
-              // Wait before reinitializing
-              await new Promise(r => setTimeout(r, 2000));
-              
-              // Reinitialize
-              await initializeAccount(accountId, 0);
-              console.log('Auto-reconnect initiated successfully');
-            } catch (err) {
-              console.error('Auto-reconnect failed:', err.message);
-              io.emit("reconnectFailed", { 
-                reason: err.message,
-                canManualRetry: true 
+              console.log(`Attempting automatic reconnection (${currentAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`);
+              io.emit("status", { isReady: false, reason: "reconnecting" });
+              io.emit("reconnecting", { 
+                attempt: currentAttempts + 1,
+                maxAttempts: MAX_RECONNECT_ATTEMPTS 
               });
               
-              // Log to Convex
-              if (isConvexReady()) {
-                eventsDb.log(accountId, "reconnect_failed", err.message).catch(() => {});
+              try {
+                // Clean up old client
+                whatsappClients.delete(accountId);
+                clientReadyStates.delete(accountId);
+                await cleanupOrphanedBrowser(accountId);
+                
+                // Wait before reinitializing
+                await new Promise(r => setTimeout(r, 2000));
+                
+                // Reinitialize
+                await initializeAccount(accountId, 0);
+                console.log('Auto-reconnect initiated successfully');
+                
+                // Reset attempts on success
+                reconnectAttempts.set(accountId, 0);
+              } catch (err) {
+                console.error(`Auto-reconnect failed (${currentAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}):`, err.message);
+                
+                // Check if we should try again
+                if (currentAttempts + 1 >= MAX_RECONNECT_ATTEMPTS) {
+                  io.emit("reconnectFailed", { 
+                    reason: `فشلت ${MAX_RECONNECT_ATTEMPTS} محاولات للاتصال. يرجى إعادة المحاولة يدوياً.`,
+                    canManualRetry: true,
+                    attempts: currentAttempts + 1 
+                  });
+                }
+                
+                // Log to Convex
+                if (isConvexReady()) {
+                  eventsDb.log(accountId, "reconnect_failed", `Attempt ${currentAttempts + 1}: ${err.message}`).catch(() => {});
+                }
               }
             }
-          }
-        }, 10000);
+          }, delay);
+          
+          reconnectTimeouts.set(accountId, timeoutId);
+        } else {
+          console.log(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached for account ${accountId}`);
+          io.emit("reconnectFailed", { 
+            reason: `تم الوصول للحد الأقصى من المحاولات (${MAX_RECONNECT_ATTEMPTS}). يرجى إعادة المحاولة يدوياً.`,
+            canManualRetry: true,
+            attempts: currentAttempts 
+          });
+        }
       }
     });
 
@@ -715,7 +874,7 @@ app.prepare().then(() => {
           poll_creation: "استطلاع 📊",
         };
         
-        io.emit("newMessage", {
+        const messageData = {
           id: message.id._serialized,
           body: message.body || typeLabels[message.type] || "",
           fromMe: true,
@@ -728,39 +887,233 @@ app.prepare().then(() => {
           senderPhone: "",
           chatName: chatName,
           isGroup: isGroup,
+        };
+        
+        // Emit new message event
+        io.emit("newMessage", messageData);
+        
+        // Also update the chat in memory for lastMessage
+        const chatId = message.to;
+        const existingChats = accountChats.get(currentAccountId) || [];
+        const chatIndex = existingChats.findIndex(c => c.id === chatId);
+        
+        if (chatIndex !== -1) {
+          // Update existing chat with sent message info
+          existingChats[chatIndex].lastMessage = {
+            body: messageData.body,
+            fromMe: true,
+            timestamp: message.timestamp,
+            type: message.type || "chat",
+            typeLabel: typeLabels[message.type] || "نص",
+            senderName: "أنا",
+          };
+          existingChats[chatIndex].timestamp = message.timestamp;
+          
+          // Emit chat update to immediately refresh lastMessage in UI
+          io.emit("chatUpdate", {
+            chatId: chatId,
+            lastMessage: existingChats[chatIndex].lastMessage,
+            timestamp: message.timestamp
+          });
+          
+          // Update Convex in background
+          if (isConvexReady()) {
+            chatsDb.upsertChat(currentAccountId, existingChats[chatIndex]).catch(() => {});
+          }
+        }
+      }
+    });
+
+    // ==================== Real-time Unread Count Updates ====================
+    // Track when messages are read from phone to update unread counts instantly
+    
+    // message_ack fires when message status changes (sent, delivered, read)
+    client.on("message_ack", async (message, ack) => {
+      if (currentAccountId !== accountId) return;
+      if (!clientReadyStates.get(accountId)) return;
+      
+      // ack values: ACK_ERROR (-1), ACK_PENDING (0), ACK_SERVER (1), ACK_DEVICE (2), ACK_READ (3), ACK_PLAYED (4)
+      // We care about ACK_READ (3) for our sent messages
+      if (message.fromMe && ack === 3) {
+        console.log(`Message read by recipient: ${message.to}`);
+        // Emit event to notify frontend
+        io.emit("messageRead", {
+          chatId: message.to,
+          messageId: message.id._serialized,
+          timestamp: Date.now()
         });
       }
+    });
+    
+    // Listen for incoming message reads (when user reads from phone)
+    // This updates the unread count when messages are viewed from phone
+    client.on("message_revoke_everyone", async (after, before) => {
+      // Message was deleted - update chats
+      if (currentAccountId !== accountId) return;
+      console.log("Message revoked, updating chats...");
+      io.emit("messageRevoked", {
+        chatId: before?.from || after?.from,
+        messageId: before?.id._serialized,
+        timestamp: Date.now()
+      });
+    });
+
+    // ==================== Auto-refresh unread counts using polling ====================
+    // WhatsApp Web.js doesn't have a direct event for "user read message from phone"
+    // So we poll for changes periodically when a chat is viewed
+    let unreadUpdateInterval = null;
+    
+    const startUnreadCountPolling = () => {
+      if (unreadUpdateInterval) return;
+      
+      // Poll every 3 seconds for unread count changes
+      unreadUpdateInterval = setInterval(async () => {
+        if (!clientReadyStates.get(accountId)) return;
+        if (currentAccountId !== accountId) return;
+        
+        try {
+          const client = getCurrentClient();
+          if (!client) return;
+          
+          // Get all chats and check for unread count changes
+          const allChats = await client.getChats();
+          const existingChats = accountChats.get(currentAccountId) || [];
+          let hasChanges = false;
+          const updates = [];
+          
+          for (const chat of allChats) {
+            const chatId = chat.id._serialized;
+            const existingChat = existingChats.find(c => c.id === chatId);
+            
+            if (existingChat && existingChat.unreadCount !== chat.unreadCount) {
+              console.log(`Unread count changed for ${chat.name || chatId}: ${existingChat.unreadCount} -> ${chat.unreadCount}`);
+              
+              // Update in memory
+              existingChat.unreadCount = chat.unreadCount;
+              hasChanges = true;
+              
+              updates.push({
+                chatId: chatId,
+                unreadCount: chat.unreadCount,
+                timestamp: Date.now()
+              });
+            }
+          }
+          
+          if (hasChanges && updates.length > 0) {
+            // Emit updates to frontend
+            io.emit("unreadCountUpdate", updates);
+            
+            // Save to disk
+            saveChats(currentAccountId, existingChats);
+            
+            // Update Convex
+            if (isConvexReady()) {
+              for (const update of updates) {
+                const chat = existingChats.find(c => c.id === update.chatId);
+                if (chat) {
+                  chatsDb.upsertChat(currentAccountId, chat).catch(() => {});
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // Ignore errors during polling
+          if (!e.message?.includes('context was destroyed')) {
+            console.log('Unread count polling error:', e.message);
+          }
+        }
+      }, 3000); // Poll every 3 seconds
+      
+      console.log(`Started unread count polling for account ${accountId}`);
+    };
+    
+    const stopUnreadCountPolling = () => {
+      if (unreadUpdateInterval) {
+        clearInterval(unreadUpdateInterval);
+        unreadUpdateInterval = null;
+        console.log(`Stopped unread count polling for account ${accountId}`);
+      }
+    };
+    
+    // Start polling when client is ready
+    client.on("ready", () => {
+      startUnreadCountPolling();
+    });
+    
+    // Stop polling when disconnected
+    client.on("disconnected", () => {
+      stopUnreadCountPolling();
     });
 
     // Track if we're currently reinitializing to prevent loops
     let isReinitializing = false;
+    let reinitTimeout = null;
     
     client.on("error", (error) => {
-      console.error(`WhatsApp client error for account ${accountId}:`, error);
+      const errorMsg = error?.message || String(error);
+      console.error(`WhatsApp client error for account ${accountId}:`, errorMsg);
       
       // Check for detached frame or closed browser errors
-      const isDetachedError = error.message && (
-        error.message.includes('Target closed') ||
-        error.message.includes('detached Frame') ||
-        error.message.includes('Session closed') ||
-        error.message.includes('Protocol error') ||
-        error.message.includes('Execution context was destroyed')
+      const isDetachedError = (
+        errorMsg.includes('Target closed') ||
+        errorMsg.includes('detached Frame') ||
+        errorMsg.includes('Session closed') ||
+        errorMsg.includes('Protocol error') ||
+        errorMsg.includes('Execution context was destroyed') ||
+        errorMsg.includes('Navigation timeout') ||
+        errorMsg.includes('net::ERR_')
       );
       
       if (isDetachedError && !isReinitializing) {
-        console.log('Browser page detached/closed, will reinitialize after cleanup...');
+        // Get current attempts
+        const currentAttempts = reconnectAttempts.get(accountId) || 0;
+        
+        // Check if we've reached max attempts
+        if (currentAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          console.log(`Max error recovery attempts reached for ${accountId}, waiting for manual reconnect`);
+          io.emit("reconnectFailed", { 
+            reason: `تم الوصول للحد الأقصى من المحاولات (${MAX_RECONNECT_ATTEMPTS}). يرجى إعادة المحاولة يدوياً.`,
+            canManualRetry: true,
+            attempts: currentAttempts 
+          });
+          return;
+        }
+        
+        console.log(`Browser page detached/closed (attempt ${currentAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}), will reinitialize...`);
         isReinitializing = true;
+        
+        // Clear any pending reinit
+        if (reinitTimeout) {
+          clearTimeout(reinitTimeout);
+        }
         
         // Mark client as not ready immediately
         clientReadyStates.set(accountId, false);
         if (currentAccountId === accountId) {
           isReady = false;
           io.emit("status", { isReady: false, reason: "reconnecting" });
+          io.emit("reconnecting", { 
+            attempt: currentAttempts + 1,
+            maxAttempts: MAX_RECONNECT_ATTEMPTS 
+          });
         }
         
-        setTimeout(async () => {
+        // Calculate delay with exponential backoff
+        const delay = Math.min(
+          RECONNECT_DELAY_BASE * Math.pow(1.5, currentAttempts),
+          RECONNECT_DELAY_MAX
+        );
+        
+        reinitTimeout = setTimeout(async () => {
+          reinitTimeout = null;
+          
           if (currentAccountId === accountId) {
-            console.log('Reinitializing WhatsApp client after detachment...');
+            console.log(`Reinitializing WhatsApp client after detachment (attempt ${currentAttempts + 1})...`);
+            
+            // Increment attempts BEFORE trying
+            reconnectAttempts.set(accountId, currentAttempts + 1);
+            
             try {
               // Destroy the old client first
               try {
@@ -779,15 +1132,32 @@ app.prepare().then(() => {
               
               // Reinitialize the account
               await initializeAccount(accountId, 0);
+              
+              // Reset attempts on success
+              reconnectAttempts.set(accountId, 0);
+              console.log('Reinitialize after detachment successful');
             } catch (err) {
-              console.error('Failed to reinitialize after detachment:', err.message);
+              console.error(`Failed to reinitialize after detachment (attempt ${currentAttempts + 1}):`, err.message);
+              
+              if (currentAttempts + 1 >= MAX_RECONNECT_ATTEMPTS) {
+                io.emit("reconnectFailed", { 
+                  reason: `فشل إعادة الاتصال بعد ${MAX_RECONNECT_ATTEMPTS} محاولات`,
+                  canManualRetry: true,
+                  attempts: currentAttempts + 1 
+                });
+              }
+              
+              // Log to Convex
+              if (isConvexReady()) {
+                eventsDb.log(accountId, "error_reinit_failed", `Attempt ${currentAttempts + 1}: ${err.message}`).catch(() => {});
+              }
             } finally {
               isReinitializing = false;
             }
           } else {
             isReinitializing = false;
           }
-        }, 5000);
+        }, delay);
       }
     });
   };
